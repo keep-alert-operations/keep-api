@@ -18,8 +18,11 @@ def runtime(request):
     from appchi.operators.executor import configured_executor, PlatformCredentials
 
     settings = request.app.state.settings
-    tokens = (settings.operator_grafana_token, settings.operator_kong_token,
-              settings.operator_probe_token)
+    tokens = (
+        settings.operator_grafana_token,
+        settings.operator_kong_token,
+        settings.operator_probe_token,
+    )
     if not settings.operator_binding or not settings.operator_database_url or not all(tokens):
         raise unavailable("operator_capabilities_unverified")
     # The API's ordinary RLS connection must not become a fleet-wide writer.
@@ -29,7 +32,8 @@ def runtime(request):
     adapter = None
     try:
         adapter = configured_executor(
-            settings.operator_binding, db,
+            settings.operator_binding,
+            db,
             PlatformCredentials(*(token.get_secret_value() for token in tokens)),
             settings=settings,
         )
@@ -66,8 +70,12 @@ def finish(request, tenant, accepted):
     operator_id = accepted["data"]["operator"]["id"]
     operation_id = operation["id"]
     deadline = time.monotonic() + REQUEST_BUDGET_SECONDS
-    fields = {"operator_id": operator_id, "operation_id": operation_id,
-              "retry_action": "retry", "outcome_may_be_partial": True}
+    fields = {
+        "operator_id": operator_id,
+        "operation_id": operation_id,
+        "retry_action": "retry",
+        "outcome_may_be_partial": True,
+    }
     try:
         current, job = snapshot(request, tenant, operator_id, operation_id)
         if job["state"] == "completed" and not job["progress"].get("continuation_id"):
@@ -82,14 +90,23 @@ def finish(request, tenant, accepted):
                         continue
                     return current
                 if job["completed_at"]:
-                    raise AppError("operator_operation_superseded", "Operation was cancelled or superseded.", 409)
+                    raise AppError(
+                        "operator_operation_superseded",
+                        "Operation was cancelled or superseded.",
+                        409,
+                    )
                 if job["error_code"] and job["error_code"] != "operator_kafka_drain_pending":
                     raise unavailable(job["error_code"])
                 if job["wait_seconds"] > 0:
                     time.sleep(min(float(job["wait_seconds"]), 0.25))
                     continue
-                run_one(db, request.app.state.settings.cipher(), adapter,
-                        tenant=tenant, operation_id=operation_id)
+                run_one(
+                    db,
+                    request.app.state.settings.cipher(),
+                    adapter,
+                    tenant=tenant,
+                    operation_id=operation_id,
+                )
                 # A competing request may own the lease. Never steal it.
                 time.sleep(0.05)
             current, job = snapshot(request, tenant, operator_id, operation_id)
@@ -99,10 +116,16 @@ def finish(request, tenant, accepted):
     except AppError as error:
         if error.status in (401, 403, 404):
             raise
-        raise AppError(error.code,
-                       "Operator change did not complete. Remote changes may be partial; inspect the operation and retry it.",
-                       error.status, fields=fields) from None
+        raise AppError(
+            error.code,
+            "Operator change did not complete. Remote changes may be partial; inspect the operation and retry it.",
+            error.status,
+            fields=fields,
+        ) from None
     except Exception:
-        raise AppError("operator_request_incomplete",
-                       "Operator outcome is uncertain. Inspect the operation before retrying.",
-                       503, fields=fields) from None
+        raise AppError(
+            "operator_request_incomplete",
+            "Operator outcome is uncertain. Inspect the operation before retrying.",
+            503,
+            fields=fields,
+        ) from None

@@ -15,11 +15,11 @@ from ldap3.core.exceptions import LDAPException
 from ldap3.utils.conv import escape_filter_chars
 
 from appchi.access import authorize
-from appchi.identity.session import authenticate
+from appchi.identity.authentication import authenticate
 from appchi.ingestion.native import canonical
 from appchi.shared.cursors import Cursor
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 from .directory import DirectoryObject, DirectoryUnavailable
 from .ldap import LDAPDirectoryReader

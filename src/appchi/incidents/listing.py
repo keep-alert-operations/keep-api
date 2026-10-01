@@ -9,7 +9,7 @@ from appchi.identity.cleanup import visible_assignee
 from appchi.shared.cursors import Cursor
 from appchi.shared.display_names import enrich_incidents
 from appchi.shared.errors import AppError
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 SORTS = {
     "created_at": "i.created_at",

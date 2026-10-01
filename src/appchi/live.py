@@ -12,7 +12,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from appchi.access import authorize
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 from appchi.shared.errors import unavailable
 
 log = logging.getLogger(__name__)
@@ -203,7 +203,9 @@ def publish_hints(db, settings, client=None, *, stop=None):
     own_client = client is None
     if own_client:
         client = Redis.from_url(
-            settings.redis_url.get_secret_value(), socket_connect_timeout=2, socket_timeout=3,
+            settings.redis_url.get_secret_value(),
+            socket_connect_timeout=2,
+            socket_timeout=3,
             retry=Retry(NoBackoff(), 0),
         )
     try:

@@ -119,15 +119,25 @@ def claim(db, *, tenant=None, operation_id=None):
 
 
 def policy_document(current, rows):
-    return json.dumps({
-            "operator_id": str(current["id"]), "tenant_id": str(current["tenant_id"]),
+    return json.dumps(
+        {
+            "operator_id": str(current["id"]),
+            "tenant_id": str(current["tenant_id"]),
             "enabled": current["lifecycle"] != "deleted" and not current["deletion_pending"],
-            "routing_names": [current["name"]] + ([current["pending_name"]] if current["pending_name"] else []),
-            "credentials": {str(r["id"]): {
-                "state": r["state"],
-                **({"expires_at": r["expires_at"].timestamp()} if r["expires_at"] else {}),
-            } for r in rows if r["state"] in ("prepared", "current", "retiring")},
-        }, sort_keys=True, separators=(",", ":"))
+            "routing_names": [current["name"]]
+            + ([current["pending_name"]] if current["pending_name"] else []),
+            "credentials": {
+                str(r["id"]): {
+                    "state": r["state"],
+                    **({"expires_at": r["expires_at"].timestamp()} if r["expires_at"] else {}),
+                }
+                for r in rows
+                if r["state"] in ("prepared", "current", "retiring")
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def work_input(db, cipher, job, op):
@@ -143,7 +153,12 @@ def work_input(db, cipher, job, op):
         ).fetchall()
         old = next((r for r in rows if r["state"] == "current"), None)
         candidate = next(
-            (r for r in rows if r["id"] == job["candidate_id"] and r["state"] in ("prepared", "current")), None
+            (
+                r
+                for r in rows
+                if r["id"] == job["candidate_id"] and r["state"] in ("prepared", "current")
+            ),
+            None,
         )
         selected = candidate if job["kind"] in ("setup", "rotate", "create_key") else old
         if (
@@ -174,7 +189,8 @@ def work_input(db, cipher, job, op):
             "INSERT INTO operator_gateway_policies(operator_id,generation,document) VALUES(%s,1,%s) "
             "ON CONFLICT(operator_id) DO UPDATE SET generation=operator_gateway_policies.generation + "
             "CASE WHEN operator_gateway_policies.document<>EXCLUDED.document THEN 1 ELSE 0 END,document=EXCLUDED.document "
-            "RETURNING generation", (op["id"], document),
+            "RETURNING generation",
+            (op["id"], document),
         ).fetchone()
         return Work(
             str(job["id"]),
@@ -189,7 +205,8 @@ def work_input(db, cipher, job, op):
             job["uncertain"],
             secret,
             job["progress"].get("cancel_kind"),
-            policy["generation"], document,
+            policy["generation"],
+            document,
             bool(job["progress"].get("activation_pending")),
             secret_unavailable,
         )
@@ -216,10 +233,19 @@ def complete(db, job, result):
         if guard["lease_token"] != job["lease_token"] or now >= guard["lease_until"]:
             return False
         states = repo.credential_states(repo.credential_rows(conn, op))
-        policy = conn.execute("SELECT * FROM operator_gateway_policies WHERE operator_id=%s FOR UPDATE", (op["id"],)).fetchone()
-        if not policy or policy["generation"] != result.policy_generation or not result.kong_verified:
+        policy = conn.execute(
+            "SELECT * FROM operator_gateway_policies WHERE operator_id=%s FOR UPDATE", (op["id"],)
+        ).fetchone()
+        if (
+            not policy
+            or policy["generation"] != result.policy_generation
+            or not result.kong_verified
+        ):
             raise unavailable("kong_policy_unverified")
-        conn.execute("UPDATE operator_gateway_policies SET verified_generation=generation,verified_at=%s WHERE operator_id=%s", (now,op["id"]))
+        conn.execute(
+            "UPDATE operator_gateway_policies SET verified_generation=generation,verified_at=%s WHERE operator_id=%s",
+            (now, op["id"]),
+        )
         kind = job["kind"]
         final_phase = current["progress"].get("final_policy_pending") is True
         restoring = kind == "create_key" and current["progress"].get("restore_cancel") is True
@@ -288,7 +314,10 @@ def complete(db, job, result):
                     "UPDATE operator_operations SET state='pending',step='gateway-activation',error_code=NULL,progress=%s,lease_token=NULL,lease_until=NULL,next_attempt_at=%s WHERE id=%s",
                     (Jsonb({**current["progress"], "activation_pending": True}), now, job["id"]),
                 )
-                conn.execute("UPDATE operator_routing_guard SET lease_token=NULL,lease_until=NULL WHERE scope='grafana' AND lease_token=%s", (job["lease_token"],))
+                conn.execute(
+                    "UPDATE operator_routing_guard SET lease_token=NULL,lease_until=NULL WHERE scope='grafana' AND lease_token=%s",
+                    (job["lease_token"],),
+                )
                 return False
             conn.execute("UPDATE operators SET lifecycle='ready' WHERE id=%s", (op["id"],))
             if restoring:
@@ -363,7 +392,12 @@ def complete(db, job, result):
                     "DELETE FROM operator_name_claims WHERE operator_id=%s AND name_key<>%s",
                     (op["id"], op["name_key"]),
                 )
-        if not final_phase and kind in ("setup", "create_key", "rename") and op["pending_name"] and not restoring:
+        if (
+            not final_phase
+            and kind in ("setup", "create_key", "rename")
+            and op["pending_name"]
+            and not restoring
+        ):
             conn.execute(
                 "UPDATE operators SET name=pending_name,name_key=pending_name_key,pending_name=NULL,pending_name_key=NULL WHERE id=%s",
                 (op["id"],),
@@ -375,9 +409,14 @@ def complete(db, job, result):
         final_op = repo.get_operator(conn, job["tenant_id"], job["operator_id"], deleted=True)
         final_document = policy_document(final_op, repo.credential_rows(conn, final_op))
         if final_document != policy["document"]:
-            conn.execute("UPDATE operator_operations SET state='pending',step='gateway-final-policy',error_code=NULL,progress=%s,lease_token=NULL,lease_until=NULL,next_attempt_at=%s WHERE id=%s",
-                         (Jsonb({**current["progress"], "final_policy_pending":True}), now, job["id"]))
-            conn.execute("UPDATE operator_routing_guard SET lease_token=NULL,lease_until=NULL WHERE scope='grafana' AND lease_token=%s",(job["lease_token"],))
+            conn.execute(
+                "UPDATE operator_operations SET state='pending',step='gateway-final-policy',error_code=NULL,progress=%s,lease_token=NULL,lease_until=NULL,next_attempt_at=%s WHERE id=%s",
+                (Jsonb({**current["progress"], "final_policy_pending": True}), now, job["id"]),
+            )
+            conn.execute(
+                "UPDATE operator_routing_guard SET lease_token=NULL,lease_until=NULL WHERE scope='grafana' AND lease_token=%s",
+                (job["lease_token"],),
+            )
             return False
         conn.execute(
             "UPDATE operators SET revision=revision+1,updated_at=%s,last_reconciled_at=%s,integration_health='in_sync' WHERE id=%s",
@@ -414,8 +453,10 @@ def complete(db, job, result):
         if kind == "delete" and not result.kong_cleanup_verified:
             fresh = repo.get_operator(conn, op["tenant_id"], op["id"], deleted=True)
             continuation = repo.enqueue(conn, fresh, {}, "cleanup")
-            conn.execute("UPDATE operator_operations SET progress=progress||jsonb_build_object('continuation_id',%s::text) WHERE id=%s",
-                         (str(continuation["id"]), job["id"]))
+            conn.execute(
+                "UPDATE operator_operations SET progress=progress||jsonb_build_object('continuation_id',%s::text) WHERE id=%s",
+                (str(continuation["id"]), job["id"]),
+            )
         if (
             kind == "cancel"
             and job["progress"].get("cancel_kind") == "delete"
@@ -425,8 +466,10 @@ def complete(db, job, result):
             if candidate:
                 fresh = repo.get_operator(conn, op["tenant_id"], op["id"])
                 continuation = repo.enqueue(conn, fresh, {}, "setup", candidate=candidate.id)
-                conn.execute("UPDATE operator_operations SET progress=progress||jsonb_build_object('continuation_id',%s::text) WHERE id=%s",
-                             (str(continuation["id"]), job["id"]))
+                conn.execute(
+                    "UPDATE operator_operations SET progress=progress||jsonb_build_object('continuation_id',%s::text) WHERE id=%s",
+                    (str(continuation["id"]), job["id"]),
+                )
         return True
 
 

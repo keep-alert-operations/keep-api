@@ -5,9 +5,10 @@ from pydantic import Field, field_validator, model_validator
 from appchi.models import StrictModel, Command, uuid_string
 from appchi.configuration.models import name, name_key
 from appchi.access import authorize, accessible_tenants, effective_role
-from appchi.identity.session import authenticate
+from appchi.identity.authentication import authenticate
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import command_result, revision, save_result, wire, audit
+from appchi.shared.transactions import command_result, revision, save_result, audit
+from appchi.serialization import wire
 
 router = APIRouter(tags=["tenants"])
 
@@ -287,8 +288,12 @@ def health(tenant_id: str, request: Request):
             "SELECT v.*,w.projection_seq AS committed_seq,w.blocked AS source_blocked FROM tenant_view_state v JOIN tenant_work_state w USING(tenant_id) WHERE tenant_id=%s",
             (tenant_id,),
         ).fetchone()
-        if conn.execute("SELECT enabled FROM kafka_pipeline_control WHERE singleton").fetchone()["enabled"]:
-            row = dict(row, source_blocked=None, source_transport="kafka", source_status="not_measured")
+        if conn.execute("SELECT enabled FROM kafka_pipeline_control WHERE singleton").fetchone()[
+            "enabled"
+        ]:
+            row = dict(
+                row, source_blocked=None, source_transport="kafka", source_status="not_measured"
+            )
         return {"data": wire(row), "meta": {}}
 
 

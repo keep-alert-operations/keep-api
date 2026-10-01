@@ -4,12 +4,12 @@ from fastapi import APIRouter, Request
 from starlette.concurrency import run_in_threadpool
 
 from appchi.access import authorize
-from appchi.identity.session import _guard
+from appchi.identity.authentication import _guard
 from appchi.shared.errors import unavailable
 
 from . import registry, repository
 from .models import ChangeView, Identifier, RegisterView, decode_model
-from .registry import RegistryLimits
+from appchi.visibility.limits import RegistryLimits
 
 router = APIRouter(tags=["visibility registry"])
 

@@ -15,7 +15,8 @@ from appchi.configuration.models import (
 )
 from appchi.shared.display_names import ActorPage, ActorRead, documented, enrich_actors
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import command_result, revision, save_result, wire
+from appchi.shared.transactions import command_result, revision, save_result
+from appchi.serialization import wire
 
 router = APIRouter(prefix="/api/tenants/{tenant_id}", tags=["configuration"])
 TABLES = {"presets": "preset_revisions", "dashboards": "dashboard_revisions"}

@@ -14,7 +14,8 @@ from appchi.recovery.evidence import Evidence, append_verified
 from appchi.shared.cursors import Cursor
 from appchi.shared.display_names import ActorPage, ActorRead, documented, enrich_actors
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import command_result, coordinator, revision, save_result, wire
+from appchi.shared.transactions import command_result, coordinator, revision, save_result
+from appchi.serialization import wire
 
 from . import repository as repo
 from .models import Create, Definition, Edit, SavedTest, Test
@@ -253,7 +254,7 @@ def validate_edit(tenant_id: str, window_id: str, body: Edit, request: Request):
 
 @router.post("/maintenance/test")
 def test(tenant_id: str, body: Test, request: Request):
-    from appchi.alerts.routes import retained, with_current_assignee
+    from appchi.alerts.state import retained, with_current_assignee
 
     ids(tenant_id)
     with request.app.state.db.transaction() as conn:
@@ -308,7 +309,7 @@ def timezones(tenant_id: str, request: Request):
 @router.post("/maintenance/{window_id}/test")
 def test_saved(tenant_id: str, window_id: str, body: SavedTest, request: Request):
     """Evaluate persisted UTC endpoints, including ended windows, without rescheduling."""
-    from appchi.alerts.routes import retained, with_current_assignee
+    from appchi.alerts.state import retained, with_current_assignee
 
     ids(tenant_id, window_id)
     with request.app.state.db.transaction() as conn:
@@ -591,7 +592,7 @@ def affected_alerts(
             (*params, limit + 1),
         ).fetchall()
         next_cursor = codec.encode(rows[limit - 1]["alert_id"]) if len(rows) > limit else None
-        from appchi.alerts.routes import with_current_assignee
+        from appchi.alerts.state import with_current_assignee
         from appchi.alerts.presentation import present_alert
 
         return {

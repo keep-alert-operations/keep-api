@@ -16,23 +16,12 @@ from appchi.ingestion.native import canonical
 from appchi.models import uuid_string
 from appchi.recovery.evidence import Evidence, append_verified
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import command_result, revision, save_result, wire
+from appchi.shared.transactions import command_result, revision, save_result
+from appchi.serialization import wire
+
+from appchi.configuration.guards import _ready as _ready, _guard as _guard
 
 router = APIRouter(prefix="/api/tenants/{tenant_id}", tags=["configuration"])
-
-
-def _ready(conn, capability="recovery"):
-    row = conn.execute(
-        "SELECT ready FROM capability_gates WHERE capability=%s FOR SHARE", (capability,)
-    ).fetchone()
-    if not row or not row["ready"]:
-        raise unavailable(capability + "_not_ready")
-
-
-def _guard(conn, tenant):
-    conn.execute(
-        "SELECT tenant_id FROM tenant_configuration_guard WHERE tenant_id=%s FOR UPDATE", (tenant,)
-    )
 
 
 def _references(conn, tenant, resource):

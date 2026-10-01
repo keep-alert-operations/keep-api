@@ -6,7 +6,7 @@ from time import monotonic
 
 from psycopg import sql
 
-from appchi.configuration.deletion import _guard, _ready
+from appchi.configuration.guards import _guard, _ready
 from appchi.configuration.retention import TABLES, retained_args, retained_versions
 
 

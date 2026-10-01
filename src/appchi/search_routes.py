@@ -7,7 +7,7 @@ from appchi.cel import compile_expression
 from appchi.search import SearchReader, SearchScope, SearchState
 from appchi.shared.display_names import AlertPage, documented, enrich_alerts
 from appchi.shared.errors import unavailable
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 from appchi.service_clients import elasticsearch_options
 
 router = APIRouter(tags=["search"])

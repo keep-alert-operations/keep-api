@@ -17,7 +17,8 @@ from appchi.ingestion.native import (
     validate_native,
 )
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import coordinator, wire
+from appchi.shared.transactions import coordinator
+from appchi.serialization import wire
 
 
 class Admission:
@@ -123,7 +124,9 @@ class Admission:
         receipt_started=None,
     ):
         with self.db.transaction() as conn:
-            if conn.execute("SELECT enabled FROM kafka_pipeline_control WHERE singleton").fetchone()["enabled"]:
+            if conn.execute(
+                "SELECT enabled FROM kafka_pipeline_control WHERE singleton"
+            ).fetchone()["enabled"]:
                 raise unavailable("legacy_pipeline_fenced")
             tenant, operator = self._route(conn, version, gateway)
             state, now = coordinator(conn, tenant)

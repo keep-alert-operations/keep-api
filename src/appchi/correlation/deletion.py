@@ -11,17 +11,13 @@ from appchi.alerts.routes import delete_command
 from appchi.ingestion.native import canonical
 from appchi.recovery.evidence import Evidence, append_verified
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import command_result, coordinator, revision, save_result, wire
+from appchi.shared.transactions import command_result, coordinator, revision, save_result
+from appchi.serialization import wire
 from . import repository as repo
 from .runtime import lock_contexts
 
 
-def _ready(conn):
-    gate = conn.execute(
-        "SELECT ready FROM capability_gates WHERE capability='recovery' FOR SHARE"
-    ).fetchone()
-    if not gate or not gate["ready"]:
-        raise unavailable("recovery_not_ready")
+from appchi.correlation.guards import _ready as _ready
 
 
 def _evidence(job, state):

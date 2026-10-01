@@ -530,14 +530,20 @@ class _Attempt:
         nonce = secrets.token_urlsafe(24)
         document = json.loads(self.work.policy_document)
         key = document["credentials"].get(credential, {})
-        allowed = document["enabled"] and key.get("state") in ("current", "retiring") and (not key.get("expires_at") or datetime.now(UTC).timestamp() < key["expires_at"])
+        allowed = (
+            document["enabled"]
+            and key.get("state") in ("current", "retiring")
+            and (not key.get("expires_at") or datetime.now(UTC).timestamp() < key["expires_at"])
+        )
         payload = {
             "operator_id": self.work.operator_id,
             "consumer_id": self.work.operator_id,
             "credential_id": credential,
             "generation": str(self.work.generation),
             "nonce": nonce,
-            "key": self.work.secret if credential in (self.work.candidate_id, self.work.current_id) else None,
+            "key": self.work.secret
+            if credential in (self.work.candidate_id, self.work.current_id)
+            else None,
             "policy_generation": str(self.work.policy_generation),
             "expected_allowed": bool(allowed),
         }
@@ -579,9 +585,14 @@ class _Attempt:
             "adapter_operation_unsupported",
         )
         self.executor.manifest.validate()
-        _require(bool(self.work.policy_document) and self.work.policy_generation > 0, "kong_policy_unverified")
+        _require(
+            bool(self.work.policy_document) and self.work.policy_generation > 0,
+            "kong_policy_unverified",
+        )
         kong = self.http("kong", "GET", "/")
-        _require(kong.get("version") == self.binding.kong_version, "operator_capabilities_unverified")
+        _require(
+            kong.get("version") == self.binding.kong_version, "operator_capabilities_unverified"
+        )
         # Denial distribution is independent of Grafana and never needs a revoked secret.
         path = "/appchi-policies/" + self.work.operator_id
         policy = {"generation": self.work.policy_generation, "document": self.work.policy_document}
@@ -593,9 +604,16 @@ class _Attempt:
             self.probe(identifier)
         if self.work.kind == "delete" and not self.ledger.deleted:
             from appchi.operators.kafka_drain import require_drain
-            require_drain(self.executor.db, self.executor.settings, self.work, self.ledger.check,
-                          deadline=self.deadline)
+
+            require_drain(
+                self.executor.db,
+                self.executor.settings,
+                self.work,
+                self.ledger.check,
+                deadline=self.deadline,
+            )
             from appchi.operators import repository as repo
+
             with self.executor.db.transaction(self.work.tenant_id) as conn:
                 operator = repo.get_operator(conn, self.work.tenant_id, self.work.operator_id)
                 repo.in_use(conn, operator)
@@ -652,8 +670,19 @@ class _Attempt:
             # remove invalid Kong material, but Grafana repair stays visible.
             self.policy([])
             self.receiver(None, remove=True)
-            return VerifiedResult(True, True, True, True, True, True, True, True,
-                                  self.work.operator_id, credential, self.work.policy_generation)
+            return VerifiedResult(
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                self.work.operator_id,
+                credential,
+                self.work.policy_generation,
+            )
         self.receiver(self.work.secret)
         self.policy(names if self.work.pending_name else [target])
         if cancelling:
@@ -672,7 +701,16 @@ class _Attempt:
         self.probe(credential)
         self.ledger.check()
         return VerifiedResult(
-            True, True, True, True, True, True, True, True, self.work.operator_id, credential,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            self.work.operator_id,
+            credential,
             self.work.policy_generation,
         )
 

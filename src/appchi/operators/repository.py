@@ -7,7 +7,8 @@ from appchi.operators import keys
 from appchi.operators.grafana import OperatorRouting
 from appchi.operators.policy import normalized_name
 from appchi.shared.errors import AppError, unavailable
-from appchi.shared.transactions import command_result, coordinator, revision, save_result, wire
+from appchi.shared.transactions import command_result, coordinator, revision, save_result
+from appchi.serialization import wire
 
 
 def get_operator(conn, tenant, identifier, *, lock=False, deleted=False):
@@ -183,9 +184,15 @@ def public(conn, row, *, admin=False):
         (row["tenant_id"], row["id"]),
     ).fetchall()
     job = active_operation(conn, row)
-    copy_fenced = row["deletion_pending"] or bool(job and (
-        job["progress"].get("activation_pending") or job["progress"].get("final_policy_pending")))
-    result["current_key_available"] = not copy_fenced and any(r["state"] == "current" for r in valid)
+    copy_fenced = row["deletion_pending"] or bool(
+        job
+        and (
+            job["progress"].get("activation_pending") or job["progress"].get("final_policy_pending")
+        )
+    )
+    result["current_key_available"] = not copy_fenced and any(
+        r["state"] == "current" for r in valid
+    )
     result["retiring_key_deadline"] = next(
         (r["expires_at"] for r in valid if r["state"] == "retiring"), None
     )
@@ -422,7 +429,11 @@ def mutate(request, tenant, identifier, body, action, target=None):
                 )
             else:
                 if job["progress"].get("final_policy_pending"):
-                    raise AppError("cancellation_unavailable", "The authoritative change has committed; final gateway verification is pending.", 409)
+                    raise AppError(
+                        "cancellation_unavailable",
+                        "The authoritative change has committed; final gateway verification is pending.",
+                        409,
+                    )
                 if job["kind"] not in ("rotate", "rename", "delete"):
                     raise AppError(
                         "cancellation_unavailable", "This operation cannot be cancelled.", 409
@@ -483,8 +494,13 @@ def copy_current(request, tenant, identifier, body):
         row = get_operator(conn, tenant, identifier, lock=True)
         revision(row, body.expected_revision)
         operation = active_operation(conn, row)
-        if operation and (operation["progress"].get("activation_pending") or operation["progress"].get("final_policy_pending")):
-            raise AppError("gateway_activation_pending", "Gateway activation is not yet verified.", 409)
+        if operation and (
+            operation["progress"].get("activation_pending")
+            or operation["progress"].get("final_policy_pending")
+        ):
+            raise AppError(
+                "gateway_activation_pending", "Gateway activation is not yet verified.", 409
+            )
         rows = credential_rows(conn, row)
         key = keys.current_for_copy(
             credential_states(rows), now, deletion_pending=row["deletion_pending"]

@@ -87,7 +87,11 @@ def describe_profile(context: Context) -> Profile:
     fields = {
         name: spec
         for name, spec in FIELDS.items()
-        if name not in LEGACY_ACK_FIELDS and (context == "feed" or name in (CORRELATION_FIELDS if context == "correlation" else RULE_FIELDS))
+        if name not in LEGACY_ACK_FIELDS
+        and (
+            context == "feed"
+            or name in (CORRELATION_FIELDS if context == "correlation" else RULE_FIELDS)
+        )
     }
     functions = [
         Function(

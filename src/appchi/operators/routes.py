@@ -11,7 +11,7 @@ from appchi.operators.synchronous import finish
 from appchi.operators.policy import normalized_name
 from appchi.shared.cursors import Cursor
 from appchi.shared.errors import AppError
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 router = APIRouter(prefix="/api/tenants/{tenant_id}/operators", tags=["operators"])
 
@@ -80,7 +80,11 @@ def rename(tenant_id: str, operator_id: str, body: OperatorRename, request: Requ
 
 @router.delete("/{operator_id}")
 def delete(tenant_id: str, operator_id: str, request: Request):
-    return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, delete_command(request), "delete"))
+    return finish(
+        request,
+        tenant_id,
+        repo.mutate(request, tenant_id, operator_id, delete_command(request), "delete"),
+    )
 
 
 @router.post("/{operator_id}/keys/current/copy")
@@ -93,7 +97,9 @@ def copy(tenant_id: str, operator_id: str, body: Command, request: Request):
 
 def key_command(action):
     def run(tenant_id: str, operator_id: str, body: Command, request: Request):
-        return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, action))
+        return finish(
+            request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, action)
+        )
 
     return run
 
@@ -114,7 +120,9 @@ for suffix, action, status in [
 
 @router.post("/{operator_id}/keys/{key_id}/revoke")
 def revoke(tenant_id: str, operator_id: str, key_id: str, body: Command, request: Request):
-    return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, "revoke", key_id))
+    return finish(
+        request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, "revoke", key_id)
+    )
 
 
 @router.get("/{operator_id}/operations/{operation_id}")
@@ -136,7 +144,11 @@ def operation(tenant_id: str, operator_id: str, operation_id: str, request: Requ
 
 def operation_command(action):
     def run(tenant_id: str, operator_id: str, operation_id: str, body: Command, request: Request):
-        return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, action, operation_id))
+        return finish(
+            request,
+            tenant_id,
+            repo.mutate(request, tenant_id, operator_id, body, action, operation_id),
+        )
 
     return run
 

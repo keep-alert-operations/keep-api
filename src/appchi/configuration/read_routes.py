@@ -14,7 +14,7 @@ from appchi.access import authorize
 from appchi.configuration.retention import retained_args, retained_versions
 from appchi.shared.cursors import Cursor
 from appchi.shared.errors import AppError
-from appchi.shared.transactions import wire
+from appchi.serialization import wire
 
 router = APIRouter(prefix="/api/tenants/{tenant_id}", tags=["configuration"])
 TABLES = {"presets": "preset_revisions", "dashboards": "dashboard_revisions"}

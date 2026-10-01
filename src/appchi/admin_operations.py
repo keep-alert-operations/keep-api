@@ -7,11 +7,12 @@ from fastapi import APIRouter, Request
 from pydantic import Field, field_validator
 
 from appchi.alerts.processor import _apply_one
-from appchi.identity.session import authenticate
+from appchi.identity.authentication import authenticate
 from appchi.maintenance.runtime import prepare_for_tenant
 from appchi.models import StrictModel, uuid_string
 from appchi.shared.errors import AppError
-from appchi.shared.transactions import audit, command_result, coordinator, save_result, wire
+from appchi.shared.transactions import audit, command_result, coordinator, save_result
+from appchi.serialization import wire
 
 router = APIRouter(tags=["administration"])
 
