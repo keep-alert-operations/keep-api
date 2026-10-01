@@ -5,6 +5,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta, UTC
 from email.utils import format_datetime
 import json
+from hashlib import sha256
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import httpx
@@ -75,6 +77,7 @@ class Remote:
         self.timeout_path = None
         self.bad_probe = False
         self.callback = None
+        self.gateway_policy = None
 
     def __call__(self, request):
         path, method = request.url.path, request.method
@@ -84,6 +87,8 @@ class Remote:
             callback, self.callback = self.callback, None
             callback(request)
         if request.url.host == "probe.test":
+            document = json.loads(self.gateway_policy["document"])
+            key = document["credentials"].get(body["credential_id"], {})
             return httpx.Response(
                 200,
                 json={
@@ -96,6 +101,12 @@ class Remote:
                             "consumer_id": body["consumer_id"],
                             "credential_id": "wrong" if self.bad_probe else body["credential_id"],
                             "ready": True,
+                            "policy_generation": str(self.gateway_policy["generation"]),
+                            "allowed": body["expected_allowed"],
+                            "tenant_id": document["tenant_id"],
+                            "version": "1.0.0",
+                            "policy_digest": sha256(self.gateway_policy["document"].encode()).hexdigest(),
+                            "expires_at": key.get("expires_at"),
                         }
                     ],
                 },
@@ -104,6 +115,10 @@ class Remote:
             if path == "/":
                 return httpx.Response(200, json={"version": "fixture-kong"})
             parts = path.strip("/").split("/")
+            if parts[0] == "appchi-policies":
+                if method == "PUT":
+                    self.gateway_policy = body
+                return httpx.Response(200, json=self.gateway_policy)
             if parts[0] == "key-auths":
                 row = self.keys.get(parts[-1])
             elif len(parts) == 2:
@@ -155,7 +170,9 @@ class Remote:
 
 
 @pytest.fixture
-def executor():
+def executor(monkeypatch):
+    monkeypatch.setattr("appchi.operators.kafka_drain.require_drain", lambda *args, **kwargs: None)
+    monkeypatch.setattr("appchi.operators.repository.in_use", lambda *args: None)
     work = Work(
         str(uuid4()),
         str(uuid4()),
@@ -170,7 +187,7 @@ def executor():
         "vena_" + "a" * 43,
     )
     binding = OperatorBinding(
-        profile="grafana-provisioning-v1-kong-key-auth-v1",
+        profile="grafana-provisioning-v1-kong-appchi-policy-v1",
         grafana_url="https://grafana.test",
         kong_url="https://kong.test",
         probe_url="https://probe.test/check",
@@ -187,10 +204,14 @@ def executor():
         serving_members=["gateway1"],
         capabilities=sorted(REQUIRED_CAPABILITIES | EXTRA_CAPABILITIES),
     )
+    work = replace(work, policy_generation=1, policy_document=json.dumps({
+        "operator_id":work.operator_id,"tenant_id":work.tenant_id,"enabled":True,
+        "routing_names":[work.name],"credentials":{work.candidate_id:{"state":"prepared"}},
+    }, sort_keys=True, separators=(",",":")))
     remote, ledger = Remote(work), Ledger(work)
     adapter = ProvisioningExecutor(
         binding,
-        None,
+        MagicMock(),
         PlatformCredentials(
             "grafana-management-secret", "kong-management-secret", "probe-management-secret"
         ),
@@ -318,8 +339,8 @@ def test_missing_plaintext_never_recreates_a_credential(executor):
     adapter.execute(work)
     ledger.invalid_ids, ledger.valid_ids = {work.candidate_id}, set()
     remote.calls.clear()
-    with pytest.raises(AppError, match="credential_decryption_unavailable"):
-        adapter.execute(replace(work, kind="cleanup", candidate_id=None, secret=None))
+    result = adapter.execute(replace(work, kind="cleanup", candidate_id=None, secret=None))
+    assert result.kong_cleanup_verified
     assert remote.keys == {}
     assert not any(call[1] == "PUT" and "/key-auth/" in call[2] for call in remote.calls)
 
@@ -342,7 +363,7 @@ def test_supported_version_mismatch_blocks_all_writes(executor):
     adapter.binding = adapter.binding.model_copy(update={"grafana_version": "different"})
     with pytest.raises(AppError, match="operator_capabilities_unverified"):
         adapter.execute(work)
-    assert not any(call[1] != "GET" for call in remote.calls)
+    assert not any(call[0] == "grafana.test" and call[1] != "GET" for call in remote.calls)
 
 
 def test_preexisting_receiver_without_durable_ownership_is_not_adopted(executor):
@@ -406,3 +427,20 @@ def test_remote_retry_after_http_date(executor):
     with pytest.raises(AppError) as caught:
         adapter.execute(work)
     assert 1198 <= caught.value.fields["retry_after_seconds"] <= 1200
+
+
+def test_denial_runs_before_unrelated_cipher_failure_or_grafana(executor):
+    adapter, remote, ledger, work = executor
+    adapter.execute(work)
+    document = json.loads(work.policy_document)
+    document["credentials"] = {}
+    ledger.invalid_ids, ledger.valid_ids = {work.candidate_id, str(uuid4())}, set()
+    remote.calls.clear()
+    with pytest.raises(AppError, match="credential_decryption_unavailable"):
+        adapter.execute(replace(work, kind="cleanup", candidate_id=None, secret=None,
+            secret_unavailable=True, policy_generation=2, policy_document=json.dumps(document)))
+    proofs = [body for host, _, _, body in remote.calls if host == "probe.test"]
+    assert {proof["credential_id"] for proof in proofs} == ledger.invalid_ids
+    assert all(proof["key"] is None and proof["expected_allowed"] is False for proof in proofs)
+    assert remote.keys == {}
+    assert not any(host == "grafana.test" for host, _, _, _ in remote.calls)

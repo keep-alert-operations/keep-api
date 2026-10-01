@@ -1,9 +1,11 @@
 import json
 import asyncio
 from time import monotonic
+from datetime import UTC, datetime
 from contextlib import suppress
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
+from threading import Event
 
 from fastapi import FastAPI, Request, Depends
 from fastapi.exceptions import RequestValidationError
@@ -14,8 +16,8 @@ from psycopg_pool import PoolTimeout
 from appchi.config import Settings
 from appchi.db import Database
 from appchi.ingestion.native import parse_json
-from appchi.ingestion.service import Admission
-from appchi.ingestion.schemas import request_schema
+from appchi.ingestion.kafka_admission import KafkaAdmission, KafkaPublisher
+from appchi.ingestion.schemas import request_schema, admission_responses
 from appchi.shared.errors import AppError, unavailable
 
 
@@ -27,11 +29,21 @@ def create_app(settings=None, db=None):
 
         if app.state.settings.role not in HTTP_ROLES:
             raise RuntimeError("This role does not expose an HTTP application")
-        app.state.db = db or Database(
+        ingress = app.state.settings.role in ("ingestion-api", "private-ingestion")
+        app.state.db = None if ingress else db or Database(
             app.state.settings.database_url.get_secret_value(),
             app.state.settings.pool_size,
             deployment_epoch=app.state.settings.deployment_epoch,
         )
+        app.state.operator_db = (
+            Database(app.state.settings.operator_database_url.get_secret_value(), 1,
+                     deployment_epoch=app.state.settings.deployment_epoch)
+            if not ingress and app.state.settings.operator_database_url else None
+        )
+        app.state.kafka_publisher = KafkaPublisher(app.state.settings) if app.state.settings.kafka_bootstrap else None
+        if not ingress:
+            from appchi.alert_notifications import configure
+            configure(app.state.settings)
         path = app.state.settings.capacity_profile
         app.state.profile = json.loads(path.read_text()) if path else None
         from appchi.visibility.runtime import capture_profile
@@ -46,7 +58,7 @@ def create_app(settings=None, db=None):
             and not app.state.profile.get("qualified")
         ):
             raise RuntimeError("A qualified capacity profile is required outside development")
-        from appchi.live import LiveRegistry, redis_listener
+        from appchi.live import LiveRegistry, hint_publisher, redis_listener
         from appchi.identity.selection_config import configured_search
 
         app.state.directory_search = configured_search(app.state.settings)
@@ -60,19 +72,33 @@ def create_app(settings=None, db=None):
         app.state.live_registry = LiveRegistry()
         listener = (
             asyncio.create_task(redis_listener(app.state.settings, app.state.live_registry))
-            if app.state.settings.redis_url
+            if not ingress and app.state.settings.redis_url
+            else None
+        )
+        publisher_stop = Event()
+        publisher = (
+            asyncio.create_task(hint_publisher(app.state.db, app.state.settings, publisher_stop))
+            if not ingress and app.state.settings.redis_url
             else None
         )
         try:
             yield
         finally:
+            # Drain the bounded thread turn before closing its shared SQL pool.
+            publisher_stop.set()
+            if publisher:
+                await publisher
             if listener:
                 listener.cancel()
                 with suppress(asyncio.CancelledError):
                     await listener
             if owned_recovery_store:
                 owned_recovery_store.close()
-            if not db:
+            if app.state.kafka_publisher:
+                app.state.kafka_publisher.close()
+            if app.state.operator_db:
+                app.state.operator_db.close()
+            if not db and app.state.db:
                 app.state.db.close()
 
     def validate_path(request: Request):
@@ -167,63 +193,70 @@ def create_app(settings=None, db=None):
     @app.middleware("http")
     async def protocol(request, call_next):
         request.state.request_id = str(uuid4())
+        request.state.received_at = datetime.now(UTC)
         try:
-            from appchi.workload import permits_http
+            async with asyncio.timeout(5 if "/ingest/" in request.url.path else None):
+                from appchi.workload import permits_http
 
-            if not permits_http(request.app.state.settings, request.url.path):
-                raise AppError("not_found", "Resource unavailable.", 404)
-            for key in request.query_params:
-                if len(request.query_params.getlist(key)) > 1:
-                    raise AppError(
-                        "duplicate_parameter", "Repeated query parameters are invalid.", 400
-                    )
-            for key in (
-                "idempotency-key",
-                "x-receipt-token",
-                "x-api-key",
-                "authorization",
-                "if-match",
-                "origin",
-                "x-csrf-token",
-            ):
-                if len(request.headers.getlist(key)) > 1:
-                    raise AppError(
-                        "duplicate_header", "Repeated security headers are invalid.", 400
-                    )
-            if request.method in ("POST", "PUT", "PATCH") and not request.url.path.startswith(
-                "/auth/"
-            ):
-                if request.headers.get("content-encoding", "identity") != "identity":
-                    raise AppError(
-                        "unsupported_encoding", "Compressed request bodies are not accepted.", 415
-                    )
-                if (
-                    request.headers.get("content-type", "").split(";")[0].lower()
-                    != "application/json"
-                ):
-                    raise AppError("unsupported_media_type", "Use application/json.", 415)
-                limit = (
-                    4 * 1024 * 1024
-                    if "/ingest/" in request.url.path
-                    else 1024 * 1024
-                    if "/correlation-rules" in request.url.path
-                    else 256 * 1024
-                    if "/maintenance" in request.url.path
-                    else 65536
-                )
-                chunks = []
-                size = 0
-                async for chunk in request.stream():
-                    size += len(chunk)
-                    if size > limit:
+                if not permits_http(request.app.state.settings, request.url.path):
+                    raise AppError("not_found", "Resource unavailable.", 404)
+                if "/ingest/" in request.url.path or (request.method in ("POST", "PUT", "PATCH", "DELETE") and request.url.path.startswith("/api/")):
+                    from appchi.clock_health import require_clock_health
+                    require_clock_health(request.app.state.settings, now=request.state.received_at)
+                for key in request.query_params:
+                    if len(request.query_params.getlist(key)) > 1:
                         raise AppError(
-                            "body_too_large", "Request body exceeds its size limit.", 413
+                            "duplicate_parameter", "Repeated query parameters are invalid.", 400
                         )
-                    chunks.append(chunk)
-                request._body = b"".join(chunks)
-                request.state.receipt_started = monotonic()
-                parse_json(request._body)
-            response = await call_next(request)
+                for key in (
+                    "idempotency-key",
+                    "x-receipt-token",
+                    "x-api-key",
+                    "authorization",
+                    "if-match",
+                    "origin",
+                    "x-csrf-token",
+                ):
+                    if len(request.headers.getlist(key)) > 1:
+                        raise AppError(
+                            "duplicate_header", "Repeated security headers are invalid.", 400
+                        )
+                if request.method in ("POST", "PUT", "PATCH") and not request.url.path.startswith(
+                    "/auth/"
+                ):
+                    if request.headers.get("content-encoding", "identity") != "identity":
+                        raise AppError(
+                            "unsupported_encoding", "Compressed request bodies are not accepted.", 415
+                        )
+                    if (
+                        request.headers.get("content-type", "").split(";")[0].lower()
+                        != "application/json"
+                    ):
+                        raise AppError("unsupported_media_type", "Use application/json.", 415)
+                    limit = (
+                        4 * 1024 * 1024
+                        if "/ingest/" in request.url.path
+                        else 1024 * 1024
+                        if "/correlation-rules" in request.url.path
+                        else 256 * 1024
+                        if "/maintenance" in request.url.path
+                        else 65536
+                    )
+                    chunks = []
+                    size = 0
+                    async for chunk in request.stream():
+                        size += len(chunk)
+                        if size > limit:
+                            raise AppError(
+                                "body_too_large", "Request body exceeds its size limit.", 413
+                            )
+                        chunks.append(chunk)
+                    request._body = b"".join(chunks)
+                    request.state.receipt_started = monotonic()
+                    parse_json(request._body)
+                response = await call_next(request)
+        except TimeoutError:
+            response = error_response(request, unavailable("ingress_timeout"))
         except AppError as error:
             response = error_response(request, error)
         response.headers.update(
@@ -253,15 +286,17 @@ def create_app(settings=None, db=None):
         return {"status": "ready", "scope": configured.role, "environment": configured.environment}
 
     def admission(request):
-        if not request.app.state.profile:
-            raise unavailable("capacity_profile_required")
-        return Admission(
-            request.app.state.db, request.app.state.settings.cipher(), request.app.state.profile
-        )
+        settings = request.app.state.settings
+        if not settings.kafka_admission_enabled:
+            raise unavailable("kafka_cutover_required")
+        if not request.app.state.kafka_publisher or not settings.global_tenant_id:
+            raise unavailable("kafka_admission_unconfigured")
+        return KafkaAdmission(request.app.state.kafka_publisher, environment=settings.environment, global_tenant_id=settings.global_tenant_id)
 
     @app.post(
         "/api/ingest/v1/alerts",
         tags=["ingestion"],
+        status_code=202, responses=admission_responses(),
         openapi_extra={
             "requestBody": {
                 "required": True,
@@ -270,20 +305,19 @@ def create_app(settings=None, db=None):
         },
     )
     async def ingest_v1(request: Request):
-        from starlette.concurrency import run_in_threadpool
-
-        status, result = await run_in_threadpool(
-            admission(request).admit,
+        status, result = await admission(request).admit(
             await request.body(),
             "v1",
             request.headers.get("idempotency-key"),
-            receipt_started=request.state.receipt_started,
+            received_at=request.state.received_at,
         )
+        result["request_id"] = request.state.request_id
         return JSONResponse(result, status)
 
     @app.post(
         "/api/ingest/v2/alerts",
         tags=["ingestion"],
+        status_code=202, responses=admission_responses(),
         openapi_extra={
             "requestBody": {
                 "required": True,
@@ -292,47 +326,32 @@ def create_app(settings=None, db=None):
         },
     )
     async def ingest_v2(request: Request):
-        from starlette.concurrency import run_in_threadpool
         from appchi.ingestion.gateway import gateway_identity
 
         gateway = gateway_identity(request)
-        status, result = await run_in_threadpool(
-            admission(request).admit,
+        status, result = await admission(request).admit(
             await request.body(),
             "v2",
             request.headers.get("idempotency-key"),
             gateway,
-            receipt_started=request.state.receipt_started,
+            received_at=request.state.received_at,
         )
+        result["request_id"] = request.state.request_id
         return JSONResponse(result, status)
 
-    @app.post("/api/ingest/v2/grafana", tags=["ingestion"])
+    @app.post("/api/ingest/v2/grafana", tags=["ingestion"], status_code=202, responses=admission_responses())
     async def ingest_grafana(request: Request):
-        from starlette.concurrency import run_in_threadpool
         from appchi.ingestion.gateway import gateway_identity
 
         gateway = gateway_identity(request)
-        status, result = await run_in_threadpool(
-            admission(request).admit_grafana,
+        status, result = await admission(request).admit_grafana(
             await request.body(),
             request.headers.get("idempotency-key"),
             gateway,
-            receipt_started=request.state.receipt_started,
+            received_at=request.state.received_at,
         )
+        result["request_id"] = request.state.request_id
         return JSONResponse(result, status)
-
-    @app.get("/api/ingest/{version}/receipts/{request_id}", tags=["ingestion"])
-    def receipt(version: str, request_id: UUID, request: Request):
-        from appchi.ingestion.gateway import gateway_identity
-
-        if version not in ("v1", "v2"):
-            raise AppError("not_found", "Receipt unavailable.", 404)
-        return admission(request).receipt(
-            request_id,
-            request.headers.get("x-receipt-token"),
-            version,
-            gateway_identity(request) if version == "v2" else None,
-        )
 
     from appchi.alerts.routes import router as alerts
     import appchi.alerts.history  # noqa: F401 -- registers authoritative history routes

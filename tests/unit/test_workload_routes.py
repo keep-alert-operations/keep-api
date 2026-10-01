@@ -26,12 +26,15 @@ class UnusedDatabase:
         ("private-ingestion", ["/auth/login", "/api/tenants", "/api/ingest/v1/alerts"]),
     ],
 )
-def test_deployed_http_role_rejects_other_surfaces_before_body_or_database(role, paths):
+def test_deployed_http_role_rejects_other_surfaces_before_body_or_database(role, paths, monkeypatch):
+    from types import SimpleNamespace
+    from uuid import uuid4
+    monkeypatch.setattr("appchi.main.KafkaPublisher", lambda settings: SimpleNamespace(close=lambda: None))
     settings = Settings(
         database_url="unused",
         wrapping_key=base64.b64encode(b"k" * 32).decode(),
         deployment_epoch="test",
-        environment="staging",
+        environment="staging", kafka_bootstrap="unused:9092", kafka_security_protocol="SSL", global_tenant_id=uuid4(),
         role=role,
     )
     with TestClient(create_app(settings, UnusedDatabase())) as client:

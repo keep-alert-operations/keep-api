@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import suppress
 import json
+import logging
 from threading import RLock
 import time
 from uuid import UUID
@@ -14,6 +15,7 @@ from appchi.access import authorize
 from appchi.shared.transactions import wire
 from appchi.shared.errors import unavailable
 
+log = logging.getLogger(__name__)
 router = APIRouter(tags=["live"])
 
 
@@ -179,22 +181,41 @@ async def events(tenant_id: str, request: Request):
     )
 
 
-def publish_hints(db, settings, client=None):
+async def hint_publisher(db, settings, stop, *, interval=1):
+    """Product API owns publishing; SQL/Redis calls stay off its event loop."""
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(publish_hints, db, settings, stop=stop)
+        except Exception:
+            # Hints are optional; pending work and PG/SSE reconciliation survive.
+            log.warning("live_hint_publication_unavailable")
+        if not stop.is_set():
+            await asyncio.sleep(interval)
+
+
+def publish_hints(db, settings, client=None, *, stop=None):
     from redis import Redis
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
 
     if client is None and not settings.redis_url:
         raise unavailable("redis_configuration_required")
     own_client = client is None
     if own_client:
         client = Redis.from_url(
-            settings.redis_url.get_secret_value(), socket_connect_timeout=2, socket_timeout=3
+            settings.redis_url.get_secret_value(), socket_connect_timeout=2, socket_timeout=3,
+            retry=Retry(NoBackoff(), 0),
         )
     try:
         with db.transaction() as conn:
             rows = conn.execute(
                 "SELECT * FROM live_hint_outbox ORDER BY updated_at,tenant_id LIMIT 100"
             ).fetchall()
+        published = 0
+        deadline = time.monotonic() + 1
         for row in rows:
+            if (stop is not None and stop.is_set()) or time.monotonic() >= deadline:
+                break
             client.publish(
                 f"appchi.{settings.environment}.tenant.{row['tenant_id']}", str(row["generation"])
             )
@@ -204,7 +225,8 @@ def publish_hints(db, settings, client=None):
                     "DELETE FROM live_hint_outbox WHERE tenant_id=%s AND generation=%s",
                     (row["tenant_id"], row["generation"]),
                 )
-        return len(rows)
+            published += 1
+        return published
     finally:
         if own_client:
             client.close()

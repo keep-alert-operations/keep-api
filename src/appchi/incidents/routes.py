@@ -9,7 +9,7 @@ from fastapi import APIRouter, Request
 from appchi.access import authorize, assignee
 from appchi.alerts.repository import publish, store_alert
 from appchi.alerts.routes import retained, pending, request_catalog, maintenance_adjust
-from appchi.maintenance.runtime import lock_catalog
+from appchi.maintenance.runtime import lock_catalog, flush_inline_effects
 from appchi.incidents.models import (
     IncidentCreate,
     IncidentStatus,
@@ -188,8 +188,7 @@ def create(tenant_id: str, body: IncidentCreate, request: Request):
         if result is not None:
             return result
         _, now = coordinator(conn, tenant_id)
-        lock_contexts(conn, tenant_id)
-        lock_catalog(conn, catalog)
+        lock_catalog(conn, catalog, targets=body.alert_ids)
         incident_id, cycle_id = uuid4(), uuid4()
         conn.execute(
             "INSERT INTO incident_identities(id,tenant_id) VALUES(%s,%s)", (incident_id, tenant_id)
@@ -231,6 +230,8 @@ def create(tenant_id: str, body: IncidentCreate, request: Request):
             "UPDATE tenant_view_state SET view_generation=view_generation+1,resource_generation=resource_generation+1 WHERE tenant_id=%s",
             (tenant_id,),
         )
+        flush_inline_effects(conn)
+        row = get_incident(conn, tenant_id, incident_id)
         return save_result(
             conn,
             scope,
@@ -253,8 +254,12 @@ def mutate(tenant, incident_id, body, request, operation):
         if result is not None:
             return result
         _, now = coordinator(conn, tenant)
-        lock_contexts(conn, tenant)
-        lock_catalog(conn, catalog)
+        targets = getattr(body, "alert_ids", ())
+        if operation == "status":
+            targets = [link["alert_id"] for link in conn.execute(
+                "SELECT alert_id FROM incident_alert_links WHERE tenant_id=%s AND incident_id=%s AND unlinked_at IS NULL",
+                (tenant, incident_id))]
+        lock_catalog(conn, catalog, targets=targets, incidents=[incident_id])
         row = get_incident(conn, tenant, incident_id, True)
         revision(row, body.expected_revision)
         changed = False
@@ -361,6 +366,7 @@ def mutate(tenant, incident_id, body, request, operation):
                 update_tokens(conn, tenant, incident_id)
         if changed:
             activity(conn, row, now, actor["id"], operation, evidence)
+        flush_inline_effects(conn)
         result = get_incident(conn, tenant, incident_id)
         return save_result(
             conn,
@@ -505,8 +511,7 @@ def move(tenant_id: str, body: IncidentMove, request: Request):
         if result is not None:
             return result
         _, now = coordinator(conn, tenant_id)
-        lock_contexts(conn, tenant_id)
-        lock_catalog(conn, catalog)
+        lock_catalog(conn, catalog, targets=body.alert_ids, incidents=[body.source_id,body.destination_id])
         rows = {
             key: get_incident(conn, tenant_id, key, True)
             for key in sorted([body.source_id, body.destination_id])
@@ -546,6 +551,7 @@ def move(tenant_id: str, body: IncidentMove, request: Request):
             activity(
                 conn, incident, now, actor["id"], "move", body.model_dump(exclude={"command_id"})
             )
+        flush_inline_effects(conn)
         return save_result(
             conn,
             scope,

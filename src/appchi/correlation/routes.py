@@ -115,6 +115,7 @@ def _save(request, tenant, body, rule_id=None, intent=None):
                 request.app.state.profile,
                 rule_id=rule_id,
                 enabled=enabled,
+                allow_local_preview=request.app.state.settings.environment == "development",
             )
         row, changed, reason = repo.persist(
             conn,

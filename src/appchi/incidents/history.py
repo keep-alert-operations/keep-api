@@ -1,6 +1,7 @@
 """Incident-owned note and history HTTP contracts."""
 
 from uuid import uuid4
+from appchi.alerts.presentation import present_alert
 from fastapi import Request
 from psycopg import sql
 
@@ -293,7 +294,10 @@ def linked_alerts(
         next_cursor = codec.encode(rows[limit - 1]["reference_id"]) if len(rows) > limit else None
         return {
             "data": wire(
-                [derived_read(conn, row) if row.get("id") else row for row in rows[:limit]]
+                [
+                    present_alert(derived_read(conn, row) if row.get("id") else row)
+                    for row in rows[:limit]
+                ]
             ),
             "meta": {},
             "next_cursor": next_cursor,

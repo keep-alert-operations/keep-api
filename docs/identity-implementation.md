@@ -1,5 +1,7 @@
 # Identity implementation and private-environment checks
 
+**2026-09-30 directory scope (REV-35):** the directory worker is nice-to-have and is not started by current launchers. Explicit trusted publication remains required for bootstrap and identity changes; automatic five-minute LDAP propagation is deferred. See [current worker scope](../spec-worker-scope.md#4-directory-synchronization-is-nice-to-have). Historical runtime evidence below does not describe a rollout of this later change.
+
 This implementation follows [the identity contract](../spec-identity-configuration.md)
 and [tenant access](../spec-tenant-access.md). Provider and directory qualification
 must be executed on the user's private nonproduction network. No company host,
@@ -247,8 +249,8 @@ requires restart if discovery or coverage changes.
 
 Discovery does not create principals, publish accepted authorization or modify
 LDAP. Unknown/changed matches and incomplete teams remain unselectable and enqueue
-immutable verification requests for the existing directory worker. After its
-complete publication, repeating the search makes eligible matches selectable.
+immutable verification requests awaiting explicit trusted publication under REV-35.
+After complete manual publication, repeating the search makes eligible matches selectable.
 Thus a live complete matching search and complete authorization evidence remain
 distinct. API health/logs do not receive LDAP credentials or raw exceptions.
 

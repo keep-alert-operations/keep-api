@@ -182,7 +182,10 @@ def public(conn, row, *, admin=False):
         "AND (state='current' OR (state='retiring' AND expires_at>clock_timestamp())) ORDER BY id",
         (row["tenant_id"], row["id"]),
     ).fetchall()
-    result["current_key_available"] = any(r["state"] == "current" for r in valid)
+    job = active_operation(conn, row)
+    copy_fenced = row["deletion_pending"] or bool(job and (
+        job["progress"].get("activation_pending") or job["progress"].get("final_policy_pending")))
+    result["current_key_available"] = not copy_fenced and any(r["state"] == "current" for r in valid)
     result["retiring_key_deadline"] = next(
         (r["expires_at"] for r in valid if r["state"] == "retiring"), None
     )
@@ -194,7 +197,6 @@ def public(conn, row, *, admin=False):
                 (row["tenant_id"], row["id"]),
             )
         ]
-        job = active_operation(conn, row)
         result["operation"] = operation_public(job) if job else None
     return wire(result)
 
@@ -299,7 +301,7 @@ def mutate(request, tenant, identifier, body, action, target=None):
         if prior is not None:
             return prior
         _, now = coordinator(conn, tenant)
-        row = get_operator(conn, tenant, identifier, lock=True)
+        row = get_operator(conn, tenant, identifier, lock=True, deleted=action == "retry")
         revision(row, body.expected_revision)
         job = active_operation(conn, row)
         rows = credential_rows(conn, row)
@@ -415,10 +417,12 @@ def mutate(request, tenant, identifier, body, action, target=None):
                 )
             if action == "retry":
                 conn.execute(
-                    "UPDATE operator_operations SET next_attempt_at=%s,state=CASE WHEN state='running' THEN state ELSE 'pending' END WHERE id=%s",
+                    "UPDATE operator_operations SET next_attempt_at=%s,error_code=NULL,state=CASE WHEN state='running' THEN state ELSE 'pending' END WHERE id=%s",
                     (now, job["id"]),
                 )
             else:
+                if job["progress"].get("final_policy_pending"):
+                    raise AppError("cancellation_unavailable", "The authoritative change has committed; final gateway verification is pending.", 409)
                 if job["kind"] not in ("rotate", "rename", "delete"):
                     raise AppError(
                         "cancellation_unavailable", "This operation cannot be cancelled.", 409
@@ -441,7 +445,7 @@ def mutate(request, tenant, identifier, body, action, target=None):
                 )
         else:
             raise ValueError("Unknown operator command")
-        row = get_operator(conn, tenant, identifier)
+        row = get_operator(conn, tenant, identifier, deleted=action == "retry")
         job = active_operation(conn, row)
         audit(
             conn,
@@ -464,7 +468,7 @@ def mutate(request, tenant, identifier, body, action, target=None):
             body.command_id,
             fp,
             response(conn, row, job),
-            200 if action.startswith("revoke") else 202,
+            202 if job else 200,
         )
 
 
@@ -478,6 +482,9 @@ def copy_current(request, tenant, identifier, body):
         _, now = coordinator(conn, tenant)
         row = get_operator(conn, tenant, identifier, lock=True)
         revision(row, body.expected_revision)
+        operation = active_operation(conn, row)
+        if operation and (operation["progress"].get("activation_pending") or operation["progress"].get("final_policy_pending")):
+            raise AppError("gateway_activation_pending", "Gateway activation is not yet verified.", 409)
         rows = credential_rows(conn, row)
         key = keys.current_for_copy(
             credential_states(rows), now, deletion_pending=row["deletion_pending"]

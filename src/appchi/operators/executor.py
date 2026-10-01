@@ -12,6 +12,7 @@ import json
 import math
 import secrets
 import time
+from hashlib import sha256
 from urllib.parse import quote
 
 import httpx
@@ -88,11 +89,13 @@ class ProvisioningExecutor:
         *,
         transport=None,
         ledger=None,
+        settings=None,
     ):
         if not all((credentials.grafana, credentials.kong, credentials.probe)):
             raise unavailable("operator_capabilities_unverified")
         self.binding, self.manifest = binding, binding.manifest()
         self.credentials = credentials
+        self.db, self.settings = db, settings
         self.ledger = ledger or PostgresLedger(db)
         self.client = httpx.Client(
             verify=binding.ca_file or True,
@@ -525,13 +528,18 @@ class _Attempt:
 
     def probe(self, credential):
         nonce = secrets.token_urlsafe(24)
+        document = json.loads(self.work.policy_document)
+        key = document["credentials"].get(credential, {})
+        allowed = document["enabled"] and key.get("state") in ("current", "retiring") and (not key.get("expires_at") or datetime.now(UTC).timestamp() < key["expires_at"])
         payload = {
             "operator_id": self.work.operator_id,
             "consumer_id": self.work.operator_id,
             "credential_id": credential,
             "generation": str(self.work.generation),
             "nonce": nonce,
-            "key": self.work.secret,
+            "key": self.work.secret if credential in (self.work.candidate_id, self.work.current_id) else None,
+            "policy_generation": str(self.work.policy_generation),
+            "expected_allowed": bool(allowed),
         }
         actual = self.http("probe", "POST", body=payload)
         _require(
@@ -553,6 +561,12 @@ class _Attempt:
                 m.get("ready") is True
                 and m.get("consumer_id") == self.work.operator_id
                 and m.get("credential_id") == credential
+                and m.get("policy_generation") == str(self.work.policy_generation)
+                and m.get("allowed") is bool(allowed)
+                and m.get("tenant_id") == self.work.tenant_id
+                and m.get("version") == "1.0.0"
+                and m.get("policy_digest") == sha256(self.work.policy_document.encode()).hexdigest()
+                and m.get("expires_at") == key.get("expires_at")
                 for m in members
             ),
             "operator_readiness_unproven",
@@ -565,9 +579,30 @@ class _Attempt:
             "adapter_operation_unsupported",
         )
         self.executor.manifest.validate()
+        _require(bool(self.work.policy_document) and self.work.policy_generation > 0, "kong_policy_unverified")
+        kong = self.http("kong", "GET", "/")
+        _require(kong.get("version") == self.binding.kong_version, "operator_capabilities_unverified")
+        # Denial distribution is independent of Grafana and never needs a revoked secret.
+        path = "/appchi-policies/" + self.work.operator_id
+        policy = {"generation": self.work.policy_generation, "document": self.work.policy_document}
+        self.http("kong", "PUT", path, policy)
+        actual = self.http("kong", "GET", path)
+        _require(all(actual.get(k) == v for k, v in policy.items()), "kong_policy_unverified")
+        credential = self.kong()
+        for identifier in sorted(self.ledger.valid_ids | self.ledger.invalid_ids):
+            self.probe(identifier)
+        if self.work.kind == "delete" and not self.ledger.deleted:
+            from appchi.operators.kafka_drain import require_drain
+            require_drain(self.executor.db, self.executor.settings, self.work, self.ledger.check,
+                          deadline=self.deadline)
+            from appchi.operators import repository as repo
+            with self.executor.db.transaction(self.work.tenant_id) as conn:
+                operator = repo.get_operator(conn, self.work.tenant_id, self.work.operator_id)
+                repo.in_use(conn, operator)
+        if self.work.secret_unavailable:
+            raise unavailable("credential_decryption_unavailable")
         health = self.http("grafana", "GET", "/api/health")
         org = self.http("grafana", "GET", "/api/org")
-        kong = self.http("kong", "GET", "/")
         _require(
             health.get("version") == self.binding.grafana_version
             and org.get("id") == self.binding.organization
@@ -593,6 +628,7 @@ class _Attempt:
             if self.ledger.deleted:
                 self.kong()
             return VerifiedResult(
+                kong_verified=True,
                 grafana_acknowledged=True,
                 grafana_verified=True,
                 complete_rule_inventory=True,
@@ -600,6 +636,8 @@ class _Attempt:
                 policy_verified=True,
                 receiver_verified=True,
                 kong_cleanup_verified=self.ledger.deleted,
+                policy_generation=self.work.policy_generation,
+                kafka_drain_verified=True,
             )
         cancelling = (
             self.work.kind == "cancel"
@@ -612,9 +650,10 @@ class _Attempt:
         if self.work.secret is None:
             # Credential-free cleanup cannot manufacture or revive a key. It can
             # remove invalid Kong material, but Grafana repair stays visible.
-            self.kong()
-            raise unavailable("credential_decryption_unavailable")
-        credential = self.kong()
+            self.policy([])
+            self.receiver(None, remove=True)
+            return VerifiedResult(True, True, True, True, True, True, True, True,
+                                  self.work.operator_id, credential, self.work.policy_generation)
         self.receiver(self.work.secret)
         self.policy(names if self.work.pending_name else [target])
         if cancelling:
@@ -633,14 +672,15 @@ class _Attempt:
         self.probe(credential)
         self.ledger.check()
         return VerifiedResult(
-            True, True, True, True, True, True, True, True, self.work.operator_id, credential
+            True, True, True, True, True, True, True, True, self.work.operator_id, credential,
+            self.work.policy_generation,
         )
 
 
-def configured_executor(path, db, credentials):
+def configured_executor(path, db, credentials, *, settings=None):
     """Load an explicitly supplied JSON binding; no fallback or default fleet."""
     try:
         binding = OperatorBinding.model_validate_json(path.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         raise unavailable("operator_capabilities_unverified") from None
-    return ProvisioningExecutor(binding, db, credentials)
+    return ProvisioningExecutor(binding, db, credentials, settings=settings)

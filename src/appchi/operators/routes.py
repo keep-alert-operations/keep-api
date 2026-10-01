@@ -7,6 +7,7 @@ from appchi.alerts.routes import delete_command
 from appchi.models import Command
 from appchi.operators.models import OperatorCreate, OperatorRename
 from appchi.operators import repository as repo
+from appchi.operators.synchronous import finish
 from appchi.operators.policy import normalized_name
 from appchi.shared.cursors import Cursor
 from appchi.shared.errors import AppError
@@ -39,8 +40,8 @@ def listing(
             now,
         )
         old = codec.decode(cursor) if cursor else None
-        query = "SELECT * FROM operators WHERE tenant_id=%s AND lifecycle<>'deleted' AND strpos(name_key,%s)>0"
-        args = [tenant_id, term]
+        query = "SELECT * FROM operators o WHERE tenant_id=%s AND (lifecycle<>'deleted' OR (%s AND EXISTS(SELECT 1 FROM operator_operations j WHERE j.operator_id=o.id AND j.completed_at IS NULL))) AND strpos(name_key,%s)>0"
+        args = [tenant_id, role == "admin", term]
         if old:
             query += " AND (name_key,id)>(%s,%s)"
             args += old["position"]
@@ -54,30 +55,32 @@ def listing(
         }
 
 
-@router.post("", status_code=202)
+@router.post("", status_code=201)
 def create(tenant_id: str, body: OperatorCreate, request: Request):
-    return repo.create(request, tenant_id, body)
+    return finish(request, tenant_id, repo.create(request, tenant_id, body))
 
 
 @router.get("/{operator_id}")
 def detail(tenant_id: str, operator_id: str, request: Request):
     with request.app.state.db.transaction() as conn:
         _, _, role = authorize(conn, request, tenant_id)
-        row = repo.get_operator(conn, tenant_id, operator_id)
+        row = repo.get_operator(conn, tenant_id, operator_id, deleted=role == "admin")
+        if row["lifecycle"] == "deleted" and not repo.active_operation(conn, row):
+            raise AppError("not_found", "Operator unavailable.", 404)
         return {
             "data": repo.public(conn, row, admin=role == "admin"),
             "meta": {"revision": str(row["revision"])},
         }
 
 
-@router.patch("/{operator_id}", status_code=202)
+@router.patch("/{operator_id}")
 def rename(tenant_id: str, operator_id: str, body: OperatorRename, request: Request):
-    return repo.mutate(request, tenant_id, operator_id, body, "rename")
+    return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, "rename"))
 
 
-@router.delete("/{operator_id}", status_code=202)
+@router.delete("/{operator_id}")
 def delete(tenant_id: str, operator_id: str, request: Request):
-    return repo.mutate(request, tenant_id, operator_id, delete_command(request), "delete")
+    return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, delete_command(request), "delete"))
 
 
 @router.post("/{operator_id}/keys/current/copy")
@@ -90,14 +93,14 @@ def copy(tenant_id: str, operator_id: str, body: Command, request: Request):
 
 def key_command(action):
     def run(tenant_id: str, operator_id: str, body: Command, request: Request):
-        return repo.mutate(request, tenant_id, operator_id, body, action)
+        return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, action))
 
     return run
 
 
 for suffix, action, status in [
-    ("rotate", "rotate", 202),
-    ("create", "create_key", 202),
+    ("rotate", "rotate", 200),
+    ("create", "create_key", 200),
     ("revoke-all", "revoke_all", 200),
 ]:
     router.add_api_route(
@@ -111,7 +114,7 @@ for suffix, action, status in [
 
 @router.post("/{operator_id}/keys/{key_id}/revoke")
 def revoke(tenant_id: str, operator_id: str, key_id: str, body: Command, request: Request):
-    return repo.mutate(request, tenant_id, operator_id, body, "revoke", key_id)
+    return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, "revoke", key_id))
 
 
 @router.get("/{operator_id}/operations/{operation_id}")
@@ -133,7 +136,7 @@ def operation(tenant_id: str, operator_id: str, operation_id: str, request: Requ
 
 def operation_command(action):
     def run(tenant_id: str, operator_id: str, operation_id: str, body: Command, request: Request):
-        return repo.mutate(request, tenant_id, operator_id, body, action, operation_id)
+        return finish(request, tenant_id, repo.mutate(request, tenant_id, operator_id, body, action, operation_id))
 
     return run
 
@@ -143,7 +146,7 @@ for action in ("retry", "cancel"):
         "/{operator_id}/operations/{operation_id}/" + action,
         operation_command(action),
         methods=["POST"],
-        status_code=202,
+        status_code=200,
         name="operator_operation_" + action,
     )
 

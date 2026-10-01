@@ -16,6 +16,39 @@ from appchi.shared.transactions import audit, command_result, coordinator, save_
 router = APIRouter(tags=["administration"])
 
 
+@router.get("/api/admin/tenants/{tenant_id}/kafka")
+def kafka_health(tenant_id: str, request: Request):
+    """Bounded sanitized diagnostics; never a per-delivery status API."""
+    with request.app.state.db.transaction() as conn:
+        _administrator(conn, request)
+        conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (tenant_id,))
+        rejected = conn.execute(
+            "SELECT delivery_id,received_at,recorded_at,error_code FROM kafka_source_results WHERE tenant_id=%s AND outcome='rejected' ORDER BY recorded_at DESC,delivery_id LIMIT 100",
+            (tenant_id,),
+        ).fetchall()
+        positions = conn.execute(
+            "SELECT * FROM kafka_consumer_positions ORDER BY consumer,topic,partition LIMIT 100"
+        ).fetchall()
+        faults = conn.execute(
+            "SELECT consumer,topic,partition,input_offset,reason,recorded_at FROM kafka_pipeline_faults ORDER BY recorded_at DESC LIMIT 100"
+        ).fetchall()
+        passes = conn.execute(
+            "SELECT index_epoch,boundary_seq,started_at,completed_at,last_page_at FROM search_reconciliation WHERE tenant_id=%s ORDER BY started_at DESC LIMIT 10",
+            (tenant_id,),
+        ).fetchall()
+        return {
+            "data": wire(
+                {
+                    "rejections": rejected,
+                    "shared_partition_positions": positions,
+                    "shared_partition_faults": faults,
+                    "search_passes": passes,
+                }
+            ),
+            "meta": {"limit": 100},
+        }
+
+
 class ProcessingRetry(StrictModel):
     command_id: str
     expected_block_generation: str
@@ -48,6 +81,16 @@ def _administrator(conn, request, *, mutation=False):
 
 def processing_health(conn, tenant):
     """Caller authorizes tenant view or global administration first."""
+    if conn.execute("SELECT enabled FROM kafka_pipeline_control WHERE singleton").fetchone()[
+        "enabled"
+    ]:
+        return {
+            "transport": "kafka",
+            "blocked": None,
+            "status": "not_measured",
+            "head": None,
+            "diagnostics": f"/api/admin/tenants/{tenant}/kafka",
+        }
     state = conn.execute(
         """SELECT w.blocked,w.block_generation,w.failures,w.next_attempt_at,
         (SELECT jsonb_build_object('id',h.id,'admission_order',h.admission_order,'received_at',h.received_at,'version',h.version)
@@ -131,6 +174,14 @@ def retry(tenant_id: str, body: ProcessingRetry, request: Request):
     # the mutation identity guard, including before any stored-result replay.
     with database.transaction() as conn:
         _administrator(conn, request)
+        if conn.execute("SELECT enabled FROM kafka_pipeline_control WHERE singleton").fetchone()[
+            "enabled"
+        ]:
+            raise AppError(
+                "legacy_pipeline_fenced",
+                "Kafka processing requires the partition recovery runbook.",
+                409,
+            )
     preparation_failure = None
     catalog = None
     try:

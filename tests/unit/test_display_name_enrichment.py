@@ -20,12 +20,13 @@ class Rows:
 
 
 class RecordingConnection:
-    """Answers the two batched lookups from in-memory tables and records each query."""
+    """Answers batched name lookups from in-memory tables and records queries."""
 
-    def __init__(self, principals=None, incidents=None, contexts=None):
+    def __init__(self, principals=None, incidents=None, contexts=None, operators=None):
         self.principals = principals or {}
         self.contexts = contexts or {}
         self.incidents = incidents or {}
+        self.operators = operators or {}
         self.queries = []
 
     def execute(self, query, args):
@@ -46,6 +47,16 @@ class RecordingConnection:
                     {"id": key, "title": title}
                     for key in ids
                     for owner, title in [self.incidents.get(key, (None, None))]
+                    if owner == tenant
+                ]
+            )
+        if "FROM operators" in query:
+            tenant, ids = args
+            return Rows(
+                [
+                    {"id": key, "name": name}
+                    for key in ids
+                    for owner, name in [self.operators.get(key, (None, None))]
                     if owner == tenant
                 ]
             )
@@ -79,21 +90,23 @@ def test_alert_rows_use_one_batched_lookup_per_source_and_never_cross_tenants():
     result = enrich_alerts(conn, tenant, rows)
     assert len(conn.queries) == 2  # one principal query, one incident query: no N+1
     principal_ids = conn.queries[0][1][0]
-    assert sorted(principal_ids) == sorted({alice, bob, rows[3]["acknowledged_by"]})
+    assert principal_ids == [alice]
     assert conn.queries[1][1] == (tenant, sorted([own, foreign]))
-    assert [
-        (r["assignee_display_name"], r["acknowledged_by_display_name"], r["active_incident_title"])
-        for r in result
-    ] == [
-        ("Alice", "Bob (deleted)", "Database outage"),
-        ("Alice", None, None),
-        (None, None, None),
-        (None, None, None),
+    assert [(r["assignee_display_name"], r["active_incident_title"]) for r in result] == [
+        ("Alice", "Database outage"),
+        ("Alice", None),
+        (None, None),
+        (None, None),
     ]
     # Every other field is carried unchanged; the input rows are not mutated.
     assert [
-        {k: v for k, v in r.items() if not k.endswith(("_display_name", "_title"))} for r in result
-    ] == rows
+        {
+            k: v
+            for k, v in r.items()
+            if not k.endswith(("_display_name", "_title")) and k != "display_status"
+        }
+        for r in result
+    ] == [{k: v for k, v in r.items() if k != "acknowledged_by"} for r in rows]
     assert "assignee_display_name" not in rows[0]
 
 
@@ -104,6 +117,29 @@ def test_empty_pages_do_not_query():
         {"id": "x", "assignee_id": None, "assignee_display_name": None}
     ]
     assert conn.queries == []
+
+
+def test_alert_operator_name_is_current_tenant_scoped_and_legacy_value_is_exact():
+    tenant, other = str(uuid4()), str(uuid4())
+    managed, foreign, missing = (str(uuid4()) for _ in range(3))
+    conn = RecordingConnection(
+        operators={managed: (tenant, "Payments"), foreign: (other, "Other tenant")}
+    )
+    rows = [
+        {"schema_version": "v2", "operator": managed},
+        {"schema_version": "v2", "operator": foreign},
+        {"schema_version": "v2", "operator": missing},
+        {"schema_version": "v1", "operator": " Legacy sender "},
+    ]
+    labelled = enrich_alerts(conn, tenant, rows)
+    assert [row["operator_display_name"] for row in labelled] == [
+        "Payments", None, None, " Legacy sender "
+    ]
+    assert [row["operator"] for row in labelled] == [row["operator"] for row in rows]
+    assert len(conn.queries) == 1
+    assert conn.queries[0][1] == (tenant, sorted([managed, foreign, missing]))
+    conn.operators[managed] = (tenant, "Payments East")
+    assert enrich_alerts(conn, tenant, rows)[0]["operator_display_name"] == "Payments East"
 
 
 def test_incident_origins_are_batched_tenant_scoped_and_correlation_only():
@@ -199,7 +235,8 @@ def test_openapi_publishes_optional_display_fields_for_changed_reads():
     assert alert["additionalProperties"] is True and "required" not in alert
     assert set(alert["properties"]) == {
         "assignee_display_name",
-        "acknowledged_by_display_name",
+        "operator_display_name",
+        "display_status",
         "active_incident_title",
     }
     detail = schemas["AlertRead"]["properties"]["data"]["$ref"].rsplit("/", 1)[1]

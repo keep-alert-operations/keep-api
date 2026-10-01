@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 import random
 import math
+import json
 from typing import Protocol
 from uuid import uuid4, UUID
 from psycopg.types.json import Jsonb
@@ -32,6 +33,10 @@ class Work:
     reconcile_first: bool
     secret: str | None = field(default=None, repr=False)
     cancel_kind: str | None = None
+    policy_generation: int = 0
+    policy_document: str = ""
+    activation_pending: bool = False
+    secret_unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,8 @@ class VerifiedResult:
     kong_cleanup_verified: bool = False
     consumer_id: str | None = None
     credential_id: str | None = None
+    policy_generation: int = 0
+    kafka_drain_verified: bool = False
 
 
 class Provisioner(Protocol):
@@ -62,10 +69,12 @@ class Provisioner(Protocol):
         ...
 
 
-def claim(db):
-    with db.transaction() as conn:
+def claim(db, *, tenant=None, operation_id=None):
+    with db.transaction(tenant) as conn:
         candidate = conn.execute(
-            "SELECT tenant_id,operator_id,id FROM operator_operations WHERE completed_at IS NULL AND next_attempt_at<=clock_timestamp() AND (lease_until IS NULL OR lease_until<=clock_timestamp()) ORDER BY next_attempt_at,id LIMIT 1"
+            "SELECT tenant_id,operator_id,id FROM operator_operations WHERE completed_at IS NULL AND next_attempt_at<=clock_timestamp() AND (lease_until IS NULL OR lease_until<=clock_timestamp()) "
+            "AND (%s::uuid IS NULL OR id=%s) AND (%s::uuid IS NULL OR tenant_id=%s) ORDER BY next_attempt_at,id LIMIT 1",
+            (operation_id, operation_id, tenant, tenant),
         ).fetchone()
     if not candidate:
         return None
@@ -109,11 +118,23 @@ def claim(db):
         }, op
 
 
+def policy_document(current, rows):
+    return json.dumps({
+            "operator_id": str(current["id"]), "tenant_id": str(current["tenant_id"]),
+            "enabled": current["lifecycle"] != "deleted" and not current["deletion_pending"],
+            "routing_names": [current["name"]] + ([current["pending_name"]] if current["pending_name"] else []),
+            "credentials": {str(r["id"]): {
+                "state": r["state"],
+                **({"expires_at": r["expires_at"].timestamp()} if r["expires_at"] else {}),
+            } for r in rows if r["state"] in ("prepared", "current", "retiring")},
+        }, sort_keys=True, separators=(",", ":"))
+
+
 def work_input(db, cipher, job, op):
     with db.transaction(op["tenant_id"]) as conn:
         # A last pre-call fence; a concurrent invalidation after this point still
         # cannot commit activation because completion repeats these checks.
-        current = repo.get_operator(conn, op["tenant_id"], op["id"], deleted=True)
+        current = repo.get_operator(conn, op["tenant_id"], op["id"], deleted=True, lock=True)
         if current["generation"] != job["generation"]:
             raise AppError("stale_provisioning_generation", "Operation changed.", 409)
         rows = conn.execute(
@@ -122,7 +143,7 @@ def work_input(db, cipher, job, op):
         ).fetchall()
         old = next((r for r in rows if r["state"] == "current"), None)
         candidate = next(
-            (r for r in rows if r["id"] == job["candidate_id"] and r["state"] == "prepared"), None
+            (r for r in rows if r["id"] == job["candidate_id"] and r["state"] in ("prepared", "current")), None
         )
         selected = candidate if job["kind"] in ("setup", "rotate", "create_key") else old
         if (
@@ -136,13 +157,25 @@ def work_input(db, cipher, job, op):
             candidate = next((r for r in rows if r["state"] == "prepared"), None)
             selected = candidate
         secret = None
+        secret_unavailable = False
         if selected and selected["ciphertext"] is not None:
             try:
                 secret = cipher.open(
                     bytes(selected["ciphertext"]), f"operator-key:{op['id']}:{selected['id']}:1"
                 ).decode()
             except Exception:
-                raise unavailable("credential_decryption_unavailable") from None
+                if job["kind"] in ("setup", "rotate", "create_key"):
+                    raise unavailable("credential_decryption_unavailable") from None
+                # Gateway denial contains no secrets and must still run when
+                # unrelated surviving-key material cannot be decrypted.
+                secret_unavailable = True
+        document = policy_document(current, rows)
+        policy = conn.execute(
+            "INSERT INTO operator_gateway_policies(operator_id,generation,document) VALUES(%s,1,%s) "
+            "ON CONFLICT(operator_id) DO UPDATE SET generation=operator_gateway_policies.generation + "
+            "CASE WHEN operator_gateway_policies.document<>EXCLUDED.document THEN 1 ELSE 0 END,document=EXCLUDED.document "
+            "RETURNING generation", (op["id"], document),
+        ).fetchone()
         return Work(
             str(job["id"]),
             str(op["id"]),
@@ -156,6 +189,9 @@ def work_input(db, cipher, job, op):
             job["uncertain"],
             secret,
             job["progress"].get("cancel_kind"),
+            policy["generation"], document,
+            bool(job["progress"].get("activation_pending")),
+            secret_unavailable,
         )
 
 
@@ -180,9 +216,18 @@ def complete(db, job, result):
         if guard["lease_token"] != job["lease_token"] or now >= guard["lease_until"]:
             return False
         states = repo.credential_states(repo.credential_rows(conn, op))
+        policy = conn.execute("SELECT * FROM operator_gateway_policies WHERE operator_id=%s FOR UPDATE", (op["id"],)).fetchone()
+        if not policy or policy["generation"] != result.policy_generation or not result.kong_verified:
+            raise unavailable("kong_policy_unverified")
+        conn.execute("UPDATE operator_gateway_policies SET verified_generation=generation,verified_at=%s WHERE operator_id=%s", (now,op["id"]))
         kind = job["kind"]
+        final_phase = current["progress"].get("final_policy_pending") is True
         restoring = kind == "create_key" and current["progress"].get("restore_cancel") is True
-        if kind in ("setup", "rotate", "create_key"):
+        if final_phase:
+            # Domain changes already committed at this point of no return.
+            # Only their exact final gateway policy may complete the operation.
+            pass
+        elif kind in ("setup", "rotate", "create_key"):
             if restoring and not (
                 current["progress"].get("cancel_kind") in ("delete", "rename", "rotate")
                 and result.complete_rule_inventory
@@ -236,6 +281,15 @@ def complete(db, job, result):
                     "ON CONFLICT(operator_id,kind) DO UPDATE SET remote_id=EXCLUDED.remote_id,generation=EXCLUDED.generation,verified_at=EXCLUDED.verified_at",
                     (op["tenant_id"], op["id"], binding, identifier, job["generation"], now),
                 )
+            if not current["progress"].get("activation_pending"):
+                # Activation is durable before distributing the allow policy.
+                # Retrying this phase never moves the retiring key's deadline.
+                conn.execute(
+                    "UPDATE operator_operations SET state='pending',step='gateway-activation',error_code=NULL,progress=%s,lease_token=NULL,lease_until=NULL,next_attempt_at=%s WHERE id=%s",
+                    (Jsonb({**current["progress"], "activation_pending": True}), now, job["id"]),
+                )
+                conn.execute("UPDATE operator_routing_guard SET lease_token=NULL,lease_until=NULL WHERE scope='grafana' AND lease_token=%s", (job["lease_token"],))
+                return False
             conn.execute("UPDATE operators SET lifecycle='ready' WHERE id=%s", (op["id"],))
             if restoring:
                 conn.execute(
@@ -257,6 +311,8 @@ def complete(db, job, result):
             ):
                 raise unavailable("grafana_verification_required")
             if kind == "delete":
+                if not result.kafka_drain_verified:
+                    raise unavailable("operator_kafka_drain_pending")
                 repo.in_use(conn, op)
                 deletion_may_commit(
                     generation_matches=True,
@@ -307,7 +363,7 @@ def complete(db, job, result):
                     "DELETE FROM operator_name_claims WHERE operator_id=%s AND name_key<>%s",
                     (op["id"], op["name_key"]),
                 )
-        if kind in ("setup", "create_key", "rename") and op["pending_name"] and not restoring:
+        if not final_phase and kind in ("setup", "create_key", "rename") and op["pending_name"] and not restoring:
             conn.execute(
                 "UPDATE operators SET name=pending_name,name_key=pending_name_key,pending_name=NULL,pending_name_key=NULL WHERE id=%s",
                 (op["id"],),
@@ -316,6 +372,13 @@ def complete(db, job, result):
                 "DELETE FROM operator_name_claims WHERE operator_id=%s AND name_key<>%s",
                 (op["id"], op["pending_name_key"]),
             )
+        final_op = repo.get_operator(conn, job["tenant_id"], job["operator_id"], deleted=True)
+        final_document = policy_document(final_op, repo.credential_rows(conn, final_op))
+        if final_document != policy["document"]:
+            conn.execute("UPDATE operator_operations SET state='pending',step='gateway-final-policy',error_code=NULL,progress=%s,lease_token=NULL,lease_until=NULL,next_attempt_at=%s WHERE id=%s",
+                         (Jsonb({**current["progress"], "final_policy_pending":True}), now, job["id"]))
+            conn.execute("UPDATE operator_routing_guard SET lease_token=NULL,lease_until=NULL WHERE scope='grafana' AND lease_token=%s",(job["lease_token"],))
+            return False
         conn.execute(
             "UPDATE operators SET revision=revision+1,updated_at=%s,last_reconciled_at=%s,integration_health='in_sync' WHERE id=%s",
             (now, now, op["id"]),
@@ -350,7 +413,9 @@ def complete(db, job, result):
         )
         if kind == "delete" and not result.kong_cleanup_verified:
             fresh = repo.get_operator(conn, op["tenant_id"], op["id"], deleted=True)
-            repo.enqueue(conn, fresh, {}, "cleanup")
+            continuation = repo.enqueue(conn, fresh, {}, "cleanup")
+            conn.execute("UPDATE operator_operations SET progress=progress||jsonb_build_object('continuation_id',%s::text) WHERE id=%s",
+                         (str(continuation["id"]), job["id"]))
         if (
             kind == "cancel"
             and job["progress"].get("cancel_kind") == "delete"
@@ -359,7 +424,9 @@ def complete(db, job, result):
             candidate = next((key for key in states if key.state == "prepared"), None)
             if candidate:
                 fresh = repo.get_operator(conn, op["tenant_id"], op["id"])
-                repo.enqueue(conn, fresh, {}, "setup", candidate=candidate.id)
+                continuation = repo.enqueue(conn, fresh, {}, "setup", candidate=candidate.id)
+                conn.execute("UPDATE operator_operations SET progress=progress||jsonb_build_object('continuation_id',%s::text) WHERE id=%s",
+                             (str(continuation["id"]), job["id"]))
         return True
 
 
@@ -381,6 +448,10 @@ def failed(db, job, error):
         "rename_verification_required",
         "kong_binding_unverified",
         "v2_activation_fenced",
+        "kong_policy_unverified",
+        "operator_kafka_drain_pending",
+        "operator_kafka_drain_unverified",
+        "operator_in_use",
     }
     code = (
         error.code
@@ -453,10 +524,12 @@ def failed(db, job, error):
         )
 
 
-def run_one(db, cipher, adapter: Provisioner | None = None):
-    expire_due(db)
-    schedule_reconciliation(db)
-    claimed = claim(db)
+def run_one(db, cipher, adapter: Provisioner | None = None, *, tenant=None, operation_id=None):
+    if operation_id is None:
+        # Retained future scheduler implementation. HTTP executes only its own job.
+        expire_due(db)
+        schedule_reconciliation(db)
+    claimed = claim(db, tenant=tenant, operation_id=operation_id)
     if not claimed:
         return False
     job, op = claimed

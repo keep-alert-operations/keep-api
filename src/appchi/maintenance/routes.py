@@ -478,8 +478,8 @@ def detail(tenant_id: str, window_id: str, request: Request, response: Response)
             conn.execute(
                 """SELECT count(DISTINCT c.alert_id) AS n FROM alert_maintenance_causes c JOIN maintenance_segments s ON s.tenant_id=c.tenant_id AND s.id=c.segment_id
                     WHERE c.tenant_id=%s AND c.window_id=%s AND c.opened_at<=%s AND (c.closed_at IS NULL OR c.closed_at>%s)
-                    AND s.end_at>%s AND (s.deactivation_at IS NULL OR s.deactivation_at>%s)""",
-                (tenant_id, window_id, now, now, now, now),
+                    """,
+                (tenant_id, window_id, now, now),
             ).fetchone()["n"]
         )
         response.headers["ETag"] = '"' + str(row["revision"]) + '"'
@@ -575,16 +575,14 @@ def affected_alerts(
                 [
                     "c.opened_at<=%s",
                     "(c.closed_at IS NULL OR c.closed_at>%s)",
-                    "s.end_at>%s",
-                    "(s.deactivation_at IS NULL OR s.deactivation_at>%s)",
                 ]
             )
-            params.extend((now, now, now, now))
+            params.extend((now, now))
         if cursor:
             clauses.append("c.alert_id>%s")
             params.append(codec.decode(cursor)["position"])
         rows = conn.execute(
-            """SELECT DISTINCT c.alert_id,a.message,a.status,a.severity,(a.id IS NULL) AS unavailable
+            """SELECT DISTINCT c.alert_id,a.tenant_id,a.message,a.status,a.severity,a.assignee_id,(a.id IS NULL) AS unavailable
              FROM alert_maintenance_causes c JOIN maintenance_segments s ON s.tenant_id=c.tenant_id AND s.id=c.segment_id
              LEFT JOIN alert_identities i ON i.tenant_id=c.tenant_id AND i.id=c.alert_id AND i.retired_at IS NULL
              LEFT JOIN alerts a ON a.tenant_id=i.tenant_id AND a.id=i.id WHERE """
@@ -593,8 +591,18 @@ def affected_alerts(
             (*params, limit + 1),
         ).fetchall()
         next_cursor = codec.encode(rows[limit - 1]["alert_id"]) if len(rows) > limit else None
+        from appchi.alerts.routes import with_current_assignee
+        from appchi.alerts.presentation import present_alert
+
         return {
-            "data": wire(rows[:limit]),
+            "data": wire(
+                [
+                    present_alert(
+                        with_current_assignee(conn, row) if not row["unavailable"] else row
+                    )
+                    for row in rows[:limit]
+                ]
+            ),
             "meta": {"coverage": "historical" if historical else "current"},
             "next_cursor": next_cursor,
         }

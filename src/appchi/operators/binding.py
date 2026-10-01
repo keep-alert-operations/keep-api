@@ -15,12 +15,15 @@ EXTRA_CAPABILITIES = frozenset(
         "wrapper_bootstrap_verified",
         "reserved_resource_namespace",
         "kong_explicit_credential_uuid",
+        "appchi_policy_v1",
+        "monotonic_policy_generation",
+        "serving_pool_allow_and_deny_proof",
     }
 )
 
 
 class OperatorBinding(StrictModel):
-    profile: Literal["grafana-provisioning-v1-kong-key-auth-v1"]
+    profile: Literal["grafana-provisioning-v1-kong-appchi-policy-v1"]
     grafana_url: str
     kong_url: str
     probe_url: str

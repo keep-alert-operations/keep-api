@@ -287,6 +287,8 @@ def health(tenant_id: str, request: Request):
             "SELECT v.*,w.projection_seq AS committed_seq,w.blocked AS source_blocked FROM tenant_view_state v JOIN tenant_work_state w USING(tenant_id) WHERE tenant_id=%s",
             (tenant_id,),
         ).fetchone()
+        if conn.execute("SELECT enabled FROM kafka_pipeline_control WHERE singleton").fetchone()["enabled"]:
+            row = dict(row, source_blocked=None, source_transport="kafka", source_status="not_measured")
         return {"data": wire(row), "meta": {}}
 
 

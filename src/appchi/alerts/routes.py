@@ -3,11 +3,12 @@ from fastapi import APIRouter, Request
 
 from appchi.access import assignee, authorize
 from appchi.alerts.lifecycle import apply_command
+from appchi.alerts.presentation import display_status, present_command_result
 from appchi.alerts.repository import publish, store_alert
 from appchi.models import AlertCommand, BulkCommand, NoteCommand, Command
 from appchi.shared.errors import AppError, unavailable
 from appchi.shared.transactions import command_result, coordinator, revision, save_result, wire
-from appchi.maintenance.runtime import prepare_for_tenant, lock_catalog, apply_transition
+from appchi.maintenance.runtime import prepare_for_tenant, lock_catalog, apply_transition, flush_inline_effects
 from appchi.maintenance.processing import derive_current
 from appchi.maintenance.temporal import MaintenanceProofError
 from appchi.cel.catalog import RULE_FIELDS
@@ -44,8 +45,19 @@ def with_current_assignee(conn, row):
     return dict(row, assignee_id=assignee_id, assignment_cleanup_pending=pending_cleanup)
 
 
+def current_command_result(conn, result):
+    # Current eligibility masks response presentation, never the immutable receipt.
+    data = result["data"]
+    rows = data if isinstance(data, list) else [data]
+    visible = [wire(with_current_assignee(conn, row)) for row in rows]
+    return present_command_result(
+        {**result, "data": visible if isinstance(data, list) else visible[0]}
+    )
+
+
 def derived_read(conn, row):
     row = with_current_assignee(conn, row)
+    row = dict(row, display_status=display_status(row))
     gate = conn.execute(
         "SELECT ready FROM capability_gates WHERE capability='maintenance'"
     ).fetchone()
@@ -75,15 +87,7 @@ def retained(conn, tenant, alert_id, lock=False):
 
 
 def pending(conn, tenant, row):
-    from hashlib import sha256
-
-    if conn.execute(
-        "SELECT 1 FROM ingest_items WHERE tenant_id=%s AND version=%s AND key_digest=%s AND disposition='pending' LIMIT 1",
-        (tenant, row["schema_version"], sha256(row["key_field"].encode()).digest()),
-    ).fetchone():
-        raise AppError(
-            "source_updates_pending", "Earlier source updates must finish before this command.", 409
-        )
+    """Compatibility call site: queued Kafka source work does not block commands."""
 
 
 @router.get("/{alert_id}", responses=documented(AlertRead))
@@ -112,9 +116,9 @@ def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request)
             conn, scope, body.command_id, {"target": alert_id, **body.model_dump()}
         )
         if result is not None:
-            return result
+            return current_command_result(conn, result)
         _, now = coordinator(conn, tenant_id)
-        lock_catalog(conn, catalog)
+        lock_catalog(conn, catalog, targets=[alert_id])
         from appchi.incidents.routes import lock_linked_incidents, linked_transition
 
         linked = lock_linked_incidents(conn, tenant_id, alert_id)
@@ -141,9 +145,14 @@ def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request)
                 original_order=order,
                 maintenance_input_recorded=True,
             )
+        flush_inline_effects(conn)
+        updated = retained(conn, tenant_id, alert_id)
         result = {"data": wire(updated), "meta": {"revision": str(updated["revision"])}}
-        return save_result(
-            conn, scope, body.command_id, fp, result, resources=[(tenant_id, "alert", alert_id)]
+        return current_command_result(
+            conn,
+            save_result(
+                conn, scope, body.command_id, fp, result, resources=[(tenant_id, "alert", alert_id)]
+            ),
         )
 
 
@@ -155,10 +164,10 @@ def bulk(tenant_id: str, body: BulkCommand, request: Request):
         scope = f"{tenant_id}:{actor['id']}:alert-bulk"
         result, fp = command_result(conn, scope, body.command_id, body.model_dump())
         if result is not None:
-            return result
+            return current_command_result(conn, result)
         _, now = coordinator(conn, tenant_id)
-        lock_catalog(conn, catalog)
         selected = {item.alert_id: item.expected_revision for item in body.items}
+        lock_catalog(conn, catalog, targets=selected)
         from appchi.incidents.routes import linked_transition
 
         linked_rows = conn.execute(
@@ -195,13 +204,18 @@ def bulk(tenant_id: str, body: BulkCommand, request: Request):
                     maintenance_input_recorded=True,
                 )
             results[key] = wire(updated)
-        return save_result(
+        flush_inline_effects(conn)
+        results = {key: wire(retained(conn, tenant_id, key)) for key in selected}
+        return current_command_result(
             conn,
-            scope,
-            body.command_id,
-            fp,
-            {"data": [results[key] for key in selected], "meta": {}},
-            resources=[(tenant_id, "alert", key) for key in selected],
+            save_result(
+                conn,
+                scope,
+                body.command_id,
+                fp,
+                {"data": [results[key] for key in selected], "meta": {}},
+                resources=[(tenant_id, "alert", key) for key in selected],
+            ),
         )
 
 
@@ -215,7 +229,7 @@ def mutate_note(conn, request, tenant, alert_id, body, note_id=None, delete=Fals
     if result is not None:
         return result
     _, now = coordinator(conn, tenant)
-    lock_catalog(conn, catalog)
+    lock_catalog(conn, catalog, targets=[alert_id])
     from appchi.incidents.routes import lock_linked_incidents
 
     lock_linked_incidents(conn, tenant, alert_id)
@@ -287,6 +301,8 @@ def mutate_note(conn, request, tenant, alert_id, body, note_id=None, delete=Fals
             original_order=order,
             maintenance_input_recorded=True,
         )
+    flush_inline_effects(conn)
+    updated = retained(conn, tenant, alert_id)
     return save_result(
         conn,
         scope,

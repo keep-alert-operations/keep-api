@@ -13,10 +13,10 @@ from appchi.access import authorize
 from appchi.models import StrictModel
 from appchi.shared.errors import unavailable
 from . import compiler
-from .catalog import FIELDS, RULE_FIELDS
+from .catalog import FIELDS, RULE_FIELDS, CORRELATION_FIELDS, LEGACY_ACK_FIELDS
 
 router = APIRouter(prefix="/api/tenants/{tenant_id}/cel", tags=["CEL"])
-Context = Literal["feed", "rule"]
+Context = Literal["feed", "rule", "correlation"]
 
 
 class ValidationRequest(StrictModel):
@@ -84,11 +84,15 @@ class ValidationResponse(StrictModel):
 
 
 def describe_profile(context: Context) -> Profile:
-    fields = FIELDS if context == "feed" else {name: FIELDS[name] for name in RULE_FIELDS}
+    fields = {
+        name: spec
+        for name, spec in FIELDS.items()
+        if name not in LEGACY_ACK_FIELDS and (context == "feed" or name in (CORRELATION_FIELDS if context == "correlation" else RULE_FIELDS))
+    }
     functions = [
         Function(
             name=name,
-            signature=f'alert.string_field.{name}("literal")',
+            signature=f'string_field.{name}("literal")',
             description="Case-sensitive literal string predicate; false on null.",
             insert_text=f'{name}("")',
         )
@@ -110,9 +114,9 @@ def describe_profile(context: Context) -> Profile:
     functions.append(
         Function(
             name="has",
-            signature="has(alert.scalar_field)",
+            signature="has(field)",
             description="True when an approved scalar field is non-null.",
-            insert_text="has(alert.)",
+            insert_text="has(",
         )
     )
     if context == "feed":
@@ -163,7 +167,7 @@ SAFE_MESSAGES = frozenset(
         "Expression exceeds 256 nodes or depth 32",
         "Only signed integers, strings, booleans and null are literals",
         "Only approved alert fields may be referenced",
-        "Only direct alert.field references are allowed",
+        "Only direct approved field references are allowed",
         "has() requires a scalar field",
         "Lists permit at most 100 nonoptional literal members",
         "Membership lists must contain homogeneous scalar literals",
@@ -232,7 +236,9 @@ def validate_cel(request: Request, tenant_id: str, body: ValidationRequest):
     result = Validation(valid=False, profile=compiler.PROFILE, context=body.context, diagnostics=[])
     failed = False
     try:
-        compiled = compiler.compile_expression(body.cel, rule=body.context == "rule")
+        compiled = compiler.compile_expression(body.cel, rule=body.context != "feed")
+        if body.context == "correlation" and "assignee_id" in compiled.fields:
+            raise compiler.CELValidationError("Unsupported field: assignee_id")
         compiled.to_elasticsearch(evaluated_at)
         result.valid = True
         result.ast_nodes = compiled.ast_nodes

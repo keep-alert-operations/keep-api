@@ -123,6 +123,8 @@ class Admission:
         receipt_started=None,
     ):
         with self.db.transaction() as conn:
+            if conn.execute("SELECT enabled FROM kafka_pipeline_control WHERE singleton").fetchone()["enabled"]:
+                raise unavailable("legacy_pipeline_fenced")
             tenant, operator = self._route(conn, version, gateway)
             state, now = coordinator(conn, tenant)
             # Anchor elapsed server time to the authoritative clock, conservatively
