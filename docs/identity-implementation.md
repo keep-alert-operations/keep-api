@@ -1,9 +1,9 @@
 # Identity implementation and private-environment checks
 
-**2026-09-30 directory scope (REV-35):** the directory worker is nice-to-have and is not started by current launchers. Explicit trusted publication remains required for bootstrap and identity changes; automatic five-minute LDAP propagation is deferred. See [current worker scope](../spec-worker-scope.md#4-directory-synchronization-is-nice-to-have). Historical runtime evidence below does not describe a rollout of this later change.
+**2026-09-30 directory scope (REV-35):** the directory worker is nice-to-have and is not started by current launchers. Explicit trusted publication remains required for bootstrap and identity changes; automatic five-minute LDAP propagation is deferred. See [current worker scope](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-worker-scope.md#4-directory-synchronization-is-nice-to-have). Historical runtime evidence below does not describe a rollout of this later change.
 
-This implementation follows [the identity contract](../spec-identity-configuration.md)
-and [tenant access](../spec-tenant-access.md). Provider and directory qualification
+This implementation follows [the identity contract](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-identity-configuration.md)
+and [tenant access](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-tenant-access.md). Provider and directory qualification
 must be executed on the user's private nonproduction network. No company host,
 directory schema, credential, installed release or successful integration is implied.
 
@@ -151,7 +151,7 @@ backend/.venv/Scripts/python.exe -m pytest backend/tests/unit/test_identity_sess
 ```
 
 On the private nonproduction deployment, record actual versions/configuration and
-execute the full [identity acceptance list](../verification-plan.md#identity):
+execute the full [identity acceptance list](https://github.com/appchi-alert-operations/appchi-design/blob/main/verification/verification-plan.md#identity):
 
 1. Fresh username/password login without OTP enrollment or challenge, SSO reuse, exact redirects, code/state/nonce
    replay rejection, same-origin CSRF, cookie properties and protected mapper rules.

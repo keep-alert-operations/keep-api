@@ -22,12 +22,8 @@ def create_app(settings=None, db=None):
             raise RuntimeError("This role does not expose an HTTP application")
         if app.state.settings.role != "product-api":
             raise RuntimeError("Use the ingestion application for ingestion roles")
-        ingress = False
         app.state.db = (
-            None
-            if ingress
-            else db
-            or Database(
+            db or Database(
                 app.state.settings.database_url.get_secret_value(),
                 app.state.settings.pool_size,
                 deployment_epoch=app.state.settings.deployment_epoch,
@@ -39,14 +35,12 @@ def create_app(settings=None, db=None):
                 1,
                 deployment_epoch=app.state.settings.deployment_epoch,
             )
-            if not ingress and app.state.settings.operator_database_url
+            if app.state.settings.operator_database_url
             else None
         )
-        app.state.kafka_publisher = None
-        if not ingress:
-            from appchi.alert_notifications import configure
+        from appchi.alert_notifications import configure
 
-            configure(app.state.settings)
+        configure(app.state.settings)
         path = app.state.settings.capacity_profile
         app.state.profile = json.loads(path.read_text()) if path else None
         from appchi.visibility.runtime import capture_profile
@@ -75,13 +69,13 @@ def create_app(settings=None, db=None):
         app.state.live_registry = LiveRegistry()
         listener = (
             asyncio.create_task(redis_listener(app.state.settings, app.state.live_registry))
-            if not ingress and app.state.settings.redis_url
+            if app.state.settings.redis_url
             else None
         )
         publisher_stop = Event()
         publisher = (
             asyncio.create_task(hint_publisher(app.state.db, app.state.settings, publisher_stop))
-            if not ingress and app.state.settings.redis_url
+            if app.state.settings.redis_url
             else None
         )
         try:
@@ -97,8 +91,6 @@ def create_app(settings=None, db=None):
                     await listener
             if owned_recovery_store:
                 owned_recovery_store.close()
-            if app.state.kafka_publisher:
-                app.state.kafka_publisher.close()
             if app.state.operator_db:
                 app.state.operator_db.close()
             if not db and app.state.db:
