@@ -23,11 +23,15 @@ from appchi.alerts.state import (
 router = APIRouter(prefix="/api/tenants/{tenant_id}/alerts", tags=["alerts"])
 
 
-def request_catalog(request, tenant):
+def request_catalog(request, tenant, *, alert_id=None, alert_ids=()):
     with request.app.state.db.transaction() as conn:
         authorize(conn, request, tenant)
     return prepare_for_tenant(
-        request.app.state.db, tenant, getattr(request.app.state, "profile", None)
+        request.app.state.db,
+        tenant,
+        getattr(request.app.state, "profile", None),
+        alert_id=alert_id,
+        alert_ids=alert_ids,
     )
 
 
@@ -49,7 +53,7 @@ def detail(tenant_id: str, alert_id: str, request: Request):
 
 @router.post("/{alert_id}/commands")
 def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request):
-    catalog = request_catalog(request, tenant_id)
+    catalog = request_catalog(request, tenant_id, alert_id=alert_id)
     with request.app.state.db.transaction() as conn:
         actor, _, _ = authorize(conn, request, tenant_id, "edit", mutation=True)
         scope = f"{tenant_id}:{actor['id']}:alert-command"
@@ -99,7 +103,7 @@ def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request)
 
 @router.post("/bulk-commands")
 def bulk(tenant_id: str, body: BulkCommand, request: Request):
-    catalog = request_catalog(request, tenant_id)
+    catalog = request_catalog(request, tenant_id, alert_ids=[item.alert_id for item in body.items])
     with request.app.state.db.transaction() as conn:
         actor, _, _ = authorize(conn, request, tenant_id, "edit", mutation=True)
         scope = f"{tenant_id}:{actor['id']}:alert-bulk"
@@ -265,14 +269,14 @@ def mutate_note(conn, request, tenant, alert_id, body, note_id=None, delete=Fals
 
 @router.post("/{alert_id}/notes", status_code=201)
 def create_note(tenant_id: str, alert_id: str, body: NoteCommand, request: Request):
-    catalog = request_catalog(request, tenant_id)
+    catalog = request_catalog(request, tenant_id, alert_id=alert_id)
     with request.app.state.db.transaction() as conn:
         return mutate_note(conn, request, tenant_id, alert_id, body, catalog=catalog)
 
 
 @router.patch("/{alert_id}/notes/{note_id}")
 def edit_note(tenant_id: str, alert_id: str, note_id: str, body: NoteCommand, request: Request):
-    catalog = request_catalog(request, tenant_id)
+    catalog = request_catalog(request, tenant_id, alert_id=alert_id)
     with request.app.state.db.transaction() as conn:
         return mutate_note(conn, request, tenant_id, alert_id, body, note_id, catalog=catalog)
 
@@ -280,7 +284,7 @@ def edit_note(tenant_id: str, alert_id: str, note_id: str, body: NoteCommand, re
 @router.delete("/{alert_id}/notes/{note_id}")
 def delete_note(tenant_id: str, alert_id: str, note_id: str, request: Request):
     body = delete_command(request)
-    catalog = request_catalog(request, tenant_id)
+    catalog = request_catalog(request, tenant_id, alert_id=alert_id)
     with request.app.state.db.transaction() as conn:
         return mutate_note(conn, request, tenant_id, alert_id, body, note_id, True, catalog)
 

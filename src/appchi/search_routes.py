@@ -1,5 +1,4 @@
 from appchi.search.control import check_search
-from elasticsearch import Elasticsearch
 from fastapi import APIRouter, Request
 
 from appchi.access import authorize
@@ -8,7 +7,7 @@ from appchi.search import SearchReader, SearchScope, SearchState
 from appchi.shared.display_names import AlertPage, documented, enrich_alerts
 from appchi.shared.errors import unavailable
 from appchi.serialization import wire
-from appchi.service_clients import elasticsearch_options
+from appchi.search_clients import search_client
 
 router = APIRouter(tags=["search"])
 
@@ -22,6 +21,7 @@ def feed(
     include_suppressed: bool = False,
     limit: int = 50,
     cursor: str | None = None,
+    replace_cursor: str | None = None,
     sort: str = "timestamp",
     direction: str = "desc",
 ):
@@ -77,26 +77,27 @@ def feed(
                 )
             }
 
-    with Elasticsearch(settings.elasticsearch_url, **elasticsearch_options(settings)) as client:
-        reader = SearchReader(
-            client,
-            settings.elasticsearch_index,
-            settings.cipher(),
-            clock=clock,
-            state=state,
-            authorize=check,
-            retained_ids=retained,
-        )
-        page = reader.page(
-            expression,
-            SearchScope(tenant_id, bytes(session["handle_hash"]).hex(), settings.deployment_epoch),
-            q=q,
-            include_suppressed=include_suppressed,
-            sort=sort,
-            direction=direction,
-            page_size=limit,
-            cursor=cursor,
-        )
+    client = search_client(request)
+    reader = SearchReader(
+        client,
+        settings.elasticsearch_index,
+        settings.cipher(),
+        clock=clock,
+        state=state,
+        authorize=check,
+        retained_ids=retained,
+    )
+    page = reader.page(
+        expression,
+        SearchScope(tenant_id, bytes(session["handle_hash"]).hex(), settings.deployment_epoch),
+        q=q,
+        include_suppressed=include_suppressed,
+        sort=sort,
+        direction=direction,
+        page_size=limit,
+        cursor=cursor,
+        replace_cursor=replace_cursor,
+    )
     with db.transaction(tenant_id) as conn:
         # Read-time labels from PG; search documents never carry display names.
         items = enrich_alerts(conn, tenant_id, page.items)
@@ -107,6 +108,8 @@ def feed(
             "evaluated_at": page.evaluated_at,
             "updating": page.updating,
             "watermark": wire(page.watermark),
+            "relative": expression.relative,
+            "close_token": page.close_token,
         },
         "next_cursor": page.next_cursor,
     }

@@ -22,12 +22,10 @@ def create_app(settings=None, db=None):
             raise RuntimeError("This role does not expose an HTTP application")
         if app.state.settings.role != "product-api":
             raise RuntimeError("Use the ingestion application for ingestion roles")
-        app.state.db = (
-            db or Database(
-                app.state.settings.database_url.get_secret_value(),
-                app.state.settings.pool_size,
-                deployment_epoch=app.state.settings.deployment_epoch,
-            )
+        app.state.db = db or Database(
+            app.state.settings.database_url.get_secret_value(),
+            app.state.settings.pool_size,
+            deployment_epoch=app.state.settings.deployment_epoch,
         )
         app.state.operator_db = (
             Database(
@@ -60,6 +58,19 @@ def create_app(settings=None, db=None):
 
         app.state.directory_search = configured_search(app.state.settings)
 
+        from elasticsearch import Elasticsearch
+        from appchi.service_clients import elasticsearch_options
+
+        app.state.search_client = (
+            Elasticsearch(
+                app.state.settings.elasticsearch_url,
+                **elasticsearch_options(app.state.settings),
+            )
+            if app.state.settings.elasticsearch_url
+            else None
+        )
+        owned_search_client = app.state.search_client
+
         app.state.recovery_store = None
         if app.state.settings.recovery_binding or app.state.settings.recovery_credential:
             from appchi.recovery.runtime import configured_store
@@ -91,6 +102,8 @@ def create_app(settings=None, db=None):
                     await listener
             if owned_recovery_store:
                 owned_recovery_store.close()
+            if owned_search_client:
+                await asyncio.to_thread(owned_search_client.close)
             if app.state.operator_db:
                 app.state.operator_db.close()
             if not db and app.state.db:

@@ -4,7 +4,7 @@ import asyncio
 from contextlib import suppress
 import json
 import logging
-from threading import RLock
+from threading import Lock, RLock
 import time
 from uuid import UUID
 
@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from appchi.access import authorize
 from appchi.serialization import wire
+from appchi.request_budget import request_budget
 from appchi.shared.errors import unavailable
 
 log = logging.getLogger(__name__)
@@ -27,7 +28,15 @@ class LiveRegistry:
     def register(self, tenant):
         with self.lock:
             entry = self.entries.setdefault(
-                tenant, {"refs": 0, "expires": 0, "value": None, "event": asyncio.Event()}
+                tenant,
+                {
+                    "refs": 0,
+                    "expires": 0,
+                    "value": None,
+                    "event": asyncio.Event(),
+                    "load_lock": Lock(),
+                    "generation": 0,
+                },
             )
             entry["refs"] += 1
             return entry["event"]
@@ -45,18 +54,28 @@ class LiveRegistry:
             entry = self.entries.get(tenant)
             if entry:
                 entry["expires"] = 0
+                entry["generation"] += 1
                 entry["event"].set()
 
     def read(self, tenant, load):
-        # The lock coalesces simultaneous cache misses. Authorization is never cached.
+        # Only worker threads wait for per-tenant loading. The registry lock
+        # protects memory only; Redis callbacks never wait for database I/O.
         with self.lock:
             entry = self.entries.get(tenant)
-            if entry is None:
-                return load()
-            if entry["expires"] <= time.monotonic():
-                entry["value"] = load()
-                entry["expires"] = time.monotonic() + 2
-            return entry["value"]
+        if entry is None:
+            return load()
+        with entry["load_lock"]:
+            with self.lock:
+                if entry["expires"] > time.monotonic():
+                    return entry["value"]
+                generation = entry["generation"]
+            value = load()
+            with self.lock:
+                entry["value"] = value
+                # An invalidation during the SELECT must force another read.
+                if entry["generation"] == generation:
+                    entry["expires"] = time.monotonic() + 2
+            return value
 
 
 async def redis_listener(settings, registry):
@@ -88,7 +107,7 @@ async def redis_listener(settings, registry):
 
 
 def state(request, tenant):
-    with request.app.state.db.transaction() as conn:
+    with request_budget(10), request.app.state.db.transaction() as conn:
         authorize(conn, request, tenant)
 
         def load():

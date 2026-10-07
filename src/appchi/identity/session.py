@@ -8,6 +8,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs
 
+from starlette.concurrency import run_in_threadpool
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
@@ -38,8 +39,11 @@ LOGIN_COOKIE = "__Host-appchi_login"
 
 @router.get("/login")
 async def login(request: Request, return_to: str = "/", fresh: bool = False):
-    with request.app.state.db.transaction() as conn:
-        require_human_auth(conn)
+    def check_login_gate():
+        with request.app.state.db.transaction() as conn:
+            require_human_auth(conn)
+
+    await run_in_threadpool(check_login_gate)
     client = oidc_client(request)
     browser = secrets.token_urlsafe(32)
     try:
@@ -51,17 +55,21 @@ async def login(request: Request, return_to: str = "/", fresh: bool = False):
     ciphertext = request.app.state.settings.cipher().seal(
         json.dumps(asdict(transaction)).encode(), "login:" + state_hash.hex()
     )
-    with request.app.state.db.transaction() as conn:
-        require_human_auth(conn)
-        conn.execute(
-            "INSERT INTO login_transactions(state_hash,browser_hash,encrypted_state,expires_at) VALUES(%s,%s,%s,%s)",
-            (
-                state_hash,
-                _hash(browser),
-                ciphertext,
-                datetime.fromtimestamp(transaction.expires_at, UTC),
-            ),
-        )
+
+    def store_login_transaction():
+        with request.app.state.db.transaction() as conn:
+            require_human_auth(conn)
+            conn.execute(
+                "INSERT INTO login_transactions(state_hash,browser_hash,encrypted_state,expires_at) VALUES(%s,%s,%s,%s)",
+                (
+                    state_hash,
+                    _hash(browser),
+                    ciphertext,
+                    datetime.fromtimestamp(transaction.expires_at, UTC),
+                ),
+            )
+
+    await run_in_threadpool(store_login_transaction)
     response = RedirectResponse(url, status_code=302)
     _cookie(response, LOGIN_COOKIE, browser)
     return response
@@ -72,15 +80,20 @@ async def callback(request: Request, state: str = "", code: str = "", error: str
     if not state or len(state) > 128 or not code or len(code) > 4096 or error:
         raise AppError("authentication_rejected", "The sign-in transaction was rejected.", 401)
     state_hash = _hash(state)
+
     # Consume before any external exchange. Failure cannot replay the same code
     # transaction, and no transaction/authorization lock spans a network call.
-    with request.app.state.db.transaction() as conn:
-        require_human_auth(conn)
-        record = conn.execute(
-            """UPDATE login_transactions SET consumed=true WHERE state_hash=%s
-                              AND consumed=false AND expires_at>clock_timestamp() RETURNING *""",
-            (state_hash,),
-        ).fetchone()
+    def consume_login_transaction():
+        with request.app.state.db.transaction() as conn:
+            require_human_auth(conn)
+            record = conn.execute(
+                """UPDATE login_transactions SET consumed=true WHERE state_hash=%s
+                                  AND consumed=false AND expires_at>clock_timestamp() RETURNING *""",
+                (state_hash,),
+            ).fetchone()
+        return record
+
+    record = await run_in_threadpool(consume_login_transaction)
     if not record:
         if "text/html" in request.headers.get("accept", "").lower():
             return RedirectResponse(
@@ -104,89 +117,98 @@ async def callback(request: Request, state: str = "", code: str = "", error: str
         raise _protocol_error(exc) from None
     identity = tokens.identity
     needs_evidence = False
-    with request.app.state.db.transaction() as conn:
-        evidence = conn.execute(
-            "SELECT verified_at,evidence_generation FROM principals WHERE directory_source=%s AND object_id=%s",
-            (identity.directory_source, identity.directory_object_id),
-        ).fetchone()
-        needs_evidence = (
-            evidence is None
-            or evidence["verified_at"] is None
-            or evidence["evidence_generation"] < 1
-        )
-        # Commit a verification request even when admission fails. This also
-        # discovers re-enablement of a previously disabled, no-longer-tracked
-        # user. Existing trusted evidence remains usable during an outage.
-        conn.execute(
-            """INSERT INTO directory_verification_requests(source,object_id)
-                     VALUES(%s,%s) ON CONFLICT DO NOTHING""",
-            (identity.directory_source, identity.directory_object_id),
-        )
+
+    def request_directory_evidence():
+        with request.app.state.db.transaction() as conn:
+            evidence = conn.execute(
+                "SELECT verified_at,evidence_generation FROM principals WHERE directory_source=%s AND object_id=%s",
+                (identity.directory_source, identity.directory_object_id),
+            ).fetchone()
+            needs_evidence = (
+                evidence is None
+                or evidence["verified_at"] is None
+                or evidence["evidence_generation"] < 1
+            )
+            # Commit a verification request even when admission fails. This also
+            # discovers re-enablement of a previously disabled, no-longer-tracked
+            # user. Existing trusted evidence remains usable during an outage.
+            conn.execute(
+                """INSERT INTO directory_verification_requests(source,object_id)
+                         VALUES(%s,%s) ON CONFLICT DO NOTHING""",
+                (identity.directory_source, identity.directory_object_id),
+            )
+        return needs_evidence
+
+    needs_evidence = await run_in_threadpool(request_directory_evidence)
     if needs_evidence:
         raise unavailable("directory_evidence_required")
     handle, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     handle_hash = _hash(handle)
-    with request.app.state.db.transaction() as conn:
-        _guard(conn, exclusive=True)
-        require_human_auth(conn)
-        principal = conn.execute(
-            "SELECT * FROM principals WHERE directory_source=%s AND object_id=%s FOR UPDATE",
-            (identity.directory_source, identity.directory_object_id),
-        ).fetchone()
-        if (
-            principal is None
-            or principal["verified_at"] is None
-            or principal["evidence_generation"] < 1
-        ):
-            raise unavailable("directory_evidence_required")
-        if principal["kind"] != "user" or not principal["eligible"] or principal["deleted"]:
-            raise AppError("authentication_rejected", "This identity is not eligible.", 401)
-        binding = conn.execute(
-            "SELECT * FROM oidc_bindings WHERE issuer=%s AND (subject=%s OR principal_id=%s)",
-            (identity.issuer, identity.subject, principal["id"]),
-        ).fetchall()
-        if any(
-            b["subject"] != identity.subject or b["principal_id"] != principal["id"]
-            for b in binding
-        ):
-            raise AppError(
-                "identity_binding_conflict", "The immutable identity binding conflicts.", 401
-            )
-        if conn.execute(
-            "SELECT 1 FROM logout_fences WHERE issuer=%s AND sid=%s AND expires_at>clock_timestamp()",
-            (identity.issuer, identity.sid),
-        ).fetchone():
-            raise AppError("authentication_rejected", "The provider session was revoked.", 401)
-        conn.execute(
-            "INSERT INTO oidc_bindings(issuer,subject,principal_id) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
-            (identity.issuer, identity.subject, principal["id"]),
-        )
-        old_handle = request.cookies.get(SESSION_COOKIE)
-        if old_handle:
+
+    def create_session():
+        with request.app.state.db.transaction() as conn:
+            _guard(conn, exclusive=True)
+            require_human_auth(conn)
+            principal = conn.execute(
+                "SELECT * FROM principals WHERE directory_source=%s AND object_id=%s FOR UPDATE",
+                (identity.directory_source, identity.directory_object_id),
+            ).fetchone()
+            if (
+                principal is None
+                or principal["verified_at"] is None
+                or principal["evidence_generation"] < 1
+            ):
+                raise unavailable("directory_evidence_required")
+            if principal["kind"] != "user" or not principal["eligible"] or principal["deleted"]:
+                raise AppError("authentication_rejected", "This identity is not eligible.", 401)
+            binding = conn.execute(
+                "SELECT * FROM oidc_bindings WHERE issuer=%s AND (subject=%s OR principal_id=%s)",
+                (identity.issuer, identity.subject, principal["id"]),
+            ).fetchall()
+            if any(
+                b["subject"] != identity.subject or b["principal_id"] != principal["id"]
+                for b in binding
+            ):
+                raise AppError(
+                    "identity_binding_conflict", "The immutable identity binding conflicts.", 401
+                )
+            if conn.execute(
+                "SELECT 1 FROM logout_fences WHERE issuer=%s AND sid=%s AND expires_at>clock_timestamp()",
+                (identity.issuer, identity.sid),
+            ).fetchone():
+                raise AppError("authentication_rejected", "The provider session was revoked.", 401)
             conn.execute(
-                "UPDATE auth_sessions SET revoked_at=clock_timestamp(),tokens=NULL WHERE handle_hash=%s",
-                (_hash(old_handle),),
+                "INSERT INTO oidc_bindings(issuer,subject,principal_id) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING",
+                (identity.issuer, identity.subject, principal["id"]),
             )
-        auth_time = datetime.fromtimestamp(identity.auth_time, UTC)
-        conn.execute(
-            """INSERT INTO auth_sessions(handle_hash,principal_id,issuer,subject,provider_sid,tokens,csrf_hash,
-                       csrf_cipher,auth_time,activity_at,absolute_at,deployment_epoch) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp(),%s,%s)""",
-            (
-                handle_hash,
-                principal["id"],
-                identity.issuer,
-                identity.subject,
-                identity.sid,
-                cipher.seal(
-                    json.dumps(tokens.tokens).encode(), "session-tokens:" + handle_hash.hex()
+            old_handle = request.cookies.get(SESSION_COOKIE)
+            if old_handle:
+                conn.execute(
+                    "UPDATE auth_sessions SET revoked_at=clock_timestamp(),tokens=NULL WHERE handle_hash=%s",
+                    (_hash(old_handle),),
+                )
+            auth_time = datetime.fromtimestamp(identity.auth_time, UTC)
+            conn.execute(
+                """INSERT INTO auth_sessions(handle_hash,principal_id,issuer,subject,provider_sid,tokens,csrf_hash,
+                           csrf_cipher,auth_time,activity_at,absolute_at,deployment_epoch) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp(),%s,%s)""",
+                (
+                    handle_hash,
+                    principal["id"],
+                    identity.issuer,
+                    identity.subject,
+                    identity.sid,
+                    cipher.seal(
+                        json.dumps(tokens.tokens).encode(), "session-tokens:" + handle_hash.hex()
+                    ),
+                    _hash(csrf),
+                    cipher.seal(csrf.encode(), "session-csrf:" + handle_hash.hex()),
+                    auth_time,
+                    auth_time + timedelta(hours=24),
+                    request.app.state.settings.deployment_epoch,
                 ),
-                _hash(csrf),
-                cipher.seal(csrf.encode(), "session-csrf:" + handle_hash.hex()),
-                auth_time,
-                auth_time + timedelta(hours=24),
-                request.app.state.settings.deployment_epoch,
-            ),
-        )
+            )
+
+    await run_in_threadpool(create_session)
     response = RedirectResponse(transaction.return_path, status_code=302)
     _cookie(response, SESSION_COOKIE, handle)
     response.delete_cookie(LOGIN_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
@@ -198,57 +220,65 @@ async def current_session(request: Request):
     from appchi.access import accessible_tenants
 
     await refresh_session(request)
-    with request.app.state.db.transaction() as conn:
-        principal, session = authenticate(conn, request)
-        csrf = (
-            request.app.state.settings.cipher()
-            .open(
-                bytes(session["csrf_cipher"]), "session-csrf:" + bytes(session["handle_hash"]).hex()
+
+    def session_response():
+        with request.app.state.db.transaction() as conn:
+            principal, session = authenticate(conn, request)
+            csrf = (
+                request.app.state.settings.cipher()
+                .open(
+                    bytes(session["csrf_cipher"]),
+                    "session-csrf:" + bytes(session["handle_hash"]).hex(),
+                )
+                .decode()
             )
-            .decode()
-        )
-        tenants = accessible_tenants(conn, principal)
-        public_tenants = [
-            {
-                "id": str(t["id"]),
-                "name": t["name"],
-                "kind": t["kind"],
-                "role": t["role"],
-                "revision": str(t["revision"]),
-            }
-            for t in tenants
-        ]
-        return JSONResponse(
-            {
-                "data": {
-                    "principal": {
-                        "id": str(principal["id"]),
-                        "display_name": principal["display_name"],
+            tenants = accessible_tenants(conn, principal)
+            public_tenants = [
+                {
+                    "id": str(t["id"]),
+                    "name": t["name"],
+                    "kind": t["kind"],
+                    "role": t["role"],
+                    "revision": str(t["revision"]),
+                }
+                for t in tenants
+            ]
+            return JSONResponse(
+                {
+                    "data": {
+                        "principal": {
+                            "id": str(principal["id"]),
+                            "display_name": principal["display_name"],
+                        },
+                        "global_super_admin": principal["super_admin"],
+                        "tenants": public_tenants,
+                        "csrf_token": csrf,
+                        "absolute_at": session["absolute_at"].isoformat(),
+                        "verified_at": principal["verified_at"].isoformat(),
+                        "refresh_uncertain": session["refresh_uncertain"],
+                        "last_tenant_id": str(session["last_tenant_id"])
+                        if session["last_tenant_id"]
+                        else None,
                     },
-                    "global_super_admin": principal["super_admin"],
-                    "tenants": public_tenants,
-                    "csrf_token": csrf,
-                    "absolute_at": session["absolute_at"].isoformat(),
-                    "verified_at": principal["verified_at"].isoformat(),
-                    "refresh_uncertain": session["refresh_uncertain"],
-                    "last_tenant_id": str(session["last_tenant_id"])
-                    if session["last_tenant_id"]
-                    else None,
+                    "meta": {},
                 },
-                "meta": {},
-            },
-            headers={"Cache-Control": "private, no-store"},
-        )
+                headers={"Cache-Control": "private, no-store"},
+            )
+
+    return await run_in_threadpool(session_response)
 
 
 @router.post("/activity")
 async def activity(request: Request):
-    with request.app.state.db.transaction() as conn:
-        _, session = authenticate(conn, request, mutation=True)
-        conn.execute(
-            "UPDATE auth_sessions SET activity_at=clock_timestamp() WHERE handle_hash=%s",
-            (session["handle_hash"],),
-        )
+    def record_activity():
+        with request.app.state.db.transaction() as conn:
+            _, session = authenticate(conn, request, mutation=True)
+            conn.execute(
+                "UPDATE auth_sessions SET activity_at=clock_timestamp() WHERE handle_hash=%s",
+                (session["handle_hash"],),
+            )
+
+    await run_in_threadpool(record_activity)
     await refresh_session(request)
     return JSONResponse(
         {"data": {"accepted": True}, "meta": {}}, headers={"Cache-Control": "private, no-store"}
@@ -257,22 +287,26 @@ async def activity(request: Request):
 
 @router.post("/logout")
 async def logout(request: Request):
-    with request.app.state.db.transaction() as conn:
-        _guard(conn, exclusive=True)
-        _, session = authenticate(conn, request, mutation=True)
-        conn.execute(
-            "UPDATE auth_sessions SET revoked_at=clock_timestamp(),tokens=NULL WHERE handle_hash=%s",
-            (session["handle_hash"],),
-        )
-        conn.execute(
-            """INSERT INTO logout_fences(issuer,sid,event_id,expires_at)
-                     VALUES(%s,%s,%s,clock_timestamp()+interval '24 hours 5 minutes') ON CONFLICT DO NOTHING""",
-            (
-                session["issuer"],
-                session["provider_sid"],
-                "local:" + bytes(session["handle_hash"]).hex(),
-            ),
-        )
+    def revoke_session():
+        with request.app.state.db.transaction() as conn:
+            _guard(conn, exclusive=True)
+            _, session = authenticate(conn, request, mutation=True)
+            conn.execute(
+                "UPDATE auth_sessions SET revoked_at=clock_timestamp(),tokens=NULL WHERE handle_hash=%s",
+                (session["handle_hash"],),
+            )
+            conn.execute(
+                """INSERT INTO logout_fences(issuer,sid,event_id,expires_at)
+                         VALUES(%s,%s,%s,clock_timestamp()+interval '24 hours 5 minutes') ON CONFLICT DO NOTHING""",
+                (
+                    session["issuer"],
+                    session["provider_sid"],
+                    "local:" + bytes(session["handle_hash"]).hex(),
+                ),
+            )
+        return session
+
+    session = await run_in_threadpool(revoke_session)
     provider_url = None
     if session["tokens"]:
         try:
@@ -319,25 +353,34 @@ async def backchannel_logout(request: Request):
         event = await oidc_client(request).validate_logout_token(values["logout_token"][0])
     except (ValueError, UnicodeError, OIDCInvalid, OIDCUnavailable) as exc:
         raise _protocol_error(exc) from None
-    with request.app.state.db.transaction() as conn:
-        _guard(conn, exclusive=True)
-        if event.subject:
-            mismatch = conn.execute(
-                "SELECT 1 FROM auth_sessions WHERE issuer=%s AND provider_sid=%s AND subject<>%s",
-                (event.issuer, event.sid, event.subject),
-            ).fetchone()
-            if mismatch:
-                raise AppError(
-                    "invalid_logout_binding", "Provider session binding does not match.", 400
-                )
-        conn.execute(
-            """INSERT INTO logout_fences(issuer,sid,event_id,expires_at) VALUES(%s,%s,%s,%s)
-                     ON CONFLICT DO NOTHING""",
-            (event.issuer, event.sid, event.jti, datetime.fromtimestamp(event.fence_until, UTC)),
-        )
-        conn.execute(
-            """UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at,clock_timestamp()),tokens=NULL
-                     WHERE issuer=%s AND provider_sid=%s""",
-            (event.issuer, event.sid),
-        )
+
+    def apply_logout_fence():
+        with request.app.state.db.transaction() as conn:
+            _guard(conn, exclusive=True)
+            if event.subject:
+                mismatch = conn.execute(
+                    "SELECT 1 FROM auth_sessions WHERE issuer=%s AND provider_sid=%s AND subject<>%s",
+                    (event.issuer, event.sid, event.subject),
+                ).fetchone()
+                if mismatch:
+                    raise AppError(
+                        "invalid_logout_binding", "Provider session binding does not match.", 400
+                    )
+            conn.execute(
+                """INSERT INTO logout_fences(issuer,sid,event_id,expires_at) VALUES(%s,%s,%s,%s)
+                         ON CONFLICT DO NOTHING""",
+                (
+                    event.issuer,
+                    event.sid,
+                    event.jti,
+                    datetime.fromtimestamp(event.fence_until, UTC),
+                ),
+            )
+            conn.execute(
+                """UPDATE auth_sessions SET revoked_at=COALESCE(revoked_at,clock_timestamp()),tokens=NULL
+                         WHERE issuer=%s AND provider_sid=%s""",
+                (event.issuer, event.sid),
+            )
+
+    await run_in_threadpool(apply_logout_fence)
     return JSONResponse({}, headers={"Cache-Control": "private, no-store"})
