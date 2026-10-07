@@ -3,7 +3,6 @@
 from hashlib import sha256
 import time
 
-from elasticsearch import Elasticsearch
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import Field, field_validator, model_validator
@@ -16,15 +15,94 @@ from appchi.configuration.routes import get_definition
 from appchi.models import Command, StrictModel, uuid_string
 from appchi.search import SearchReader, SearchScope, SearchState
 from appchi.search.control import check_search
-from appchi.search.counts import CountReader, CountState
+from appchi.search.counts import CountQuery, CountReader, CountState
 from appchi.search.projection import canonical
 from appchi.search.reader import sort_spec
 from appchi.shared.display_names import AlertPage, documented, enrich_alerts
 from appchi.shared.errors import AppError, unavailable
 from appchi.serialization import wire
-from appchi.service_clients import elasticsearch_options
+from appchi.search_clients import search_client
 
 router = APIRouter(prefix="/api/tenants/{tenant_id}", tags=["configuration"])
+
+
+class QuickCountQuery(StrictModel):
+    id: str = Field(min_length=1, max_length=64)
+    cel: str = Field(default="true", max_length=16384)
+    q: str = Field(default="", max_length=256)
+    include_suppressed: bool = False
+
+
+class QuickCountRequest(StrictModel):
+    queries: list[QuickCountQuery] = Field(min_length=1, max_length=24)
+
+    @model_validator(mode="after")
+    def unique(self):
+        if len({query.id for query in self.queries}) != len(self.queries):
+            raise ValueError("Query IDs must be unique")
+        return self
+
+
+class SnapshotClose(StrictModel):
+    token: str = Field(min_length=1, max_length=65536)
+
+
+@router.post("/alerts/counts")
+def quick_counts(tenant_id: str, body: QuickCountRequest, request: Request):
+    deadline = time.monotonic() + 10
+    db, settings = request.app.state.db, request.app.state.settings
+    with db.transaction() as conn:
+        _begin(conn, request, tenant_id, deadline)
+        before = _state(conn, tenant_id)
+        evaluated_at = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+    queries = {
+        item.id: CountQuery(compile_expression(item.cel), item.q, item.include_suppressed)
+        for item in body.queries
+    }
+
+    def revalidate():
+        with db.transaction() as conn:
+            _begin(conn, request, tenant_id, deadline)
+            return _state(conn, tenant_id)
+
+    batch = CountReader(search_client(request), settings.elasticsearch_index).read(
+        queries,
+        tenant_id,
+        evaluated_at=evaluated_at,
+        before=before,
+        revalidate=revalidate,
+        deadline=deadline,
+    )
+    return {
+        "data": {
+            "counts": {key: str(value) for key, value in batch.counts.items()},
+            "relative": any(query.expression.relative for query in queries.values()),
+            "evaluated_at": batch.evaluated_at,
+            "watermark": batch.watermark,
+            "observed": batch.observed,
+            "updating": batch.updating,
+        },
+        "meta": {"profile": PROFILE},
+    }
+
+
+@router.post("/alerts/snapshot/close")
+def close_snapshot(tenant_id: str, body: SnapshotClose, request: Request):
+    settings = request.app.state.settings
+    with request.app.state.db.transaction() as conn:
+        _, session, _ = authorize(conn, request, tenant_id, mutation=True)
+    scope = SearchScope(tenant_id, bytes(session["handle_hash"]).hex(), settings.deployment_epoch)
+    reader = SearchReader(
+        search_client(request),
+        settings.elasticsearch_index,
+        settings.cipher(),
+        clock=lambda: None,
+        state=lambda _: None,
+        authorize=lambda _: None,
+        retained_ids=lambda *_: set(),
+    )
+    reader.close_snapshot(body.token, scope)
+    return {"data": {"closed": True}, "meta": {}}
 
 
 class CountRequest(StrictModel):
@@ -222,15 +300,15 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
                 raise AppError("preset_changed", "Preset changed; retry the count.", 409)
             return _state(conn, tenant)
 
-    with Elasticsearch(settings.elasticsearch_url, **elasticsearch_options(settings)) as client:
-        batch = CountReader(client, settings.elasticsearch_index).read(
-            expressions,
-            tenant,
-            evaluated_at=evaluated_at,
-            before=before,
-            revalidate=revalidate,
-            deadline=deadline,
-        )
+    client = search_client(request)
+    batch = CountReader(client, settings.elasticsearch_index).read(
+        expressions,
+        tenant,
+        evaluated_at=evaluated_at,
+        before=before,
+        revalidate=revalidate,
+        deadline=deadline,
+    )
     _budget(deadline)
     data = {
         "observation_id": batch.observation_id,
@@ -357,26 +435,26 @@ def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
                 )
             }
 
-    with Elasticsearch(settings.elasticsearch_url, **elasticsearch_options(settings)) as client:
-        reader = SearchReader(
-            _DeadlineClient(client, deadline),
-            settings.elasticsearch_index,
-            settings.cipher(),
-            clock=clock,
-            state=state,
-            authorize=check,
-            retained_ids=retained,
-        )
-        page = reader.page(
-            expression,
-            scope,
-            q=body.q,
-            include_suppressed=body.include_suppressed,
-            ordering=order,
-            page_size=body.limit,
-            cursor=body.cursor,
-            replace_cursor=body.replace_cursor,
-        )
+    client = search_client(request)
+    reader = SearchReader(
+        _DeadlineClient(client, deadline),
+        settings.elasticsearch_index,
+        settings.cipher(),
+        clock=clock,
+        state=state,
+        authorize=check,
+        retained_ids=retained,
+    )
+    page = reader.page(
+        expression,
+        scope,
+        q=body.q,
+        include_suppressed=body.include_suppressed,
+        ordering=order,
+        page_size=body.limit,
+        cursor=body.cursor,
+        replace_cursor=body.replace_cursor,
+    )
     _budget(deadline)
     with db.transaction(tenant_id) as conn:
         # Read-time labels from PG; search documents never carry display names.
@@ -394,6 +472,8 @@ def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
                     "observed": page.observed,
                     "profile": PROFILE,
                     "applied": context,
+                    "relative": expression.relative,
+                    "close_token": page.close_token,
                 }
             ),
             "next_cursor": page.next_cursor,

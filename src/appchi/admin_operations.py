@@ -183,11 +183,29 @@ def retry(tenant_id: str, body: ProcessingRetry, request: Request):
                 "Kafka processing requires the partition recovery runbook.",
                 409,
             )
+        conn.execute("SELECT set_config('appchi.tenant_id',%s,true)", (tenant_id,))
+        prepared_head = conn.execute(
+            "SELECT * FROM ingest_items WHERE tenant_id=%s AND disposition='pending' ORDER BY admission_order LIMIT 1",
+            (tenant_id,),
+        ).fetchone()
+        claim = (
+            conn.execute(
+                "SELECT alert_id FROM alert_key_claims WHERE tenant_id=%s AND schema_version=%s AND key_digest=%s",
+                (tenant_id, prepared_head["version"], prepared_head["key_digest"]),
+            ).fetchone()
+            if prepared_head
+            else None
+        )
     preparation_failure = None
     catalog = None
     try:
         catalog = prepare_for_tenant(
-            database, tenant_id, getattr(request.app.state, "profile", None)
+            database,
+            tenant_id,
+            getattr(request.app.state, "profile", None),
+            alert_id=claim["alert_id"] if claim else None,
+            effective_at=prepared_head["received_at"] if prepared_head else None,
+            source_item=prepared_head,
         )
     except Exception as error:
         preparation_failure = _proof_code(error)

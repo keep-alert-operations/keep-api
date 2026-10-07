@@ -44,7 +44,7 @@ router = APIRouter(prefix="/api/tenants/{tenant_id}/incidents", tags=["incidents
 
 @router.post("", status_code=201)
 def create(tenant_id: str, body: IncidentCreate, request: Request):
-    catalog = request_catalog(request, tenant_id)
+    catalog = request_catalog(request, tenant_id, alert_ids=body.alert_ids)
     with request.app.state.db.transaction() as conn:
         actor, _, _ = authorize(conn, request, tenant_id, "edit", mutation=True)
         scope = f"{tenant_id}:{actor['id']}:incident-create"
@@ -108,7 +108,22 @@ def create(tenant_id: str, body: IncidentCreate, request: Request):
 
 
 def mutate(tenant, incident_id, body, request, operation):
-    catalog = request_catalog(request, tenant)
+    prepared_targets = getattr(body, "alert_ids", ())
+    if operation == "status":
+        with request.app.state.db.transaction() as conn:
+            authorize(conn, request, tenant, "edit", mutation=True)
+            prepared_targets = [
+                link["alert_id"]
+                for link in conn.execute(
+                    "SELECT alert_id FROM incident_alert_links WHERE tenant_id=%s AND incident_id=%s AND unlinked_at IS NULL",
+                    (tenant, incident_id),
+                )
+            ]
+    catalog = (
+        request_catalog(request, tenant, alert_ids=prepared_targets)
+        if operation in ("status", "link", "unlink")
+        else None
+    )
     with request.app.state.db.transaction() as conn:
         actor, _, _ = authorize(conn, request, tenant, "edit", mutation=True)
         scope = f"{tenant}:{actor['id']}:incident-{operation}"
@@ -347,7 +362,7 @@ def detail(tenant_id: str, incident_id: str, request: Request):
 
 @router.post("/move-alerts")
 def move(tenant_id: str, body: IncidentMove, request: Request):
-    catalog = request_catalog(request, tenant_id)
+    catalog = request_catalog(request, tenant_id, alert_ids=body.alert_ids)
     if body.source_id == body.destination_id:
         raise AppError("invalid_destination", "Choose a different destination.")
     with request.app.state.db.transaction() as conn:
