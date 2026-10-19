@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "ca_file": "/etc/appchi/kong-ca.crt",
+  "deadline_seconds": 1.5,
+  "max_response_bytes": 8192,
+  "max_inflight": 2,
+  "members": [
+    {
+      "member_id": "REPLACE_WITH_OBSERVED_KONG_NODE_ID",
+      "policy_url": "https://appchi-kong-0.appchi-kong-members:8443/__appchi/operator-check",
+      "auth_url": "https://appchi-kong-0.appchi-kong-members:8443/__appchi/operator-auth-check"
+    }
+  ]
+}

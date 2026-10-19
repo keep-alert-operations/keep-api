@@ -26,3 +26,10 @@ packages without changing release dependency pins.
 
 `poetry run appchi-api` is the entrypoint. Supply the documented environment
 bindings; package installation does not start services or migrate data.
+
+For an isolated cluster's fixed Kong serving pool, the same image can run the
+private HTTPS proof process with `python -m appchi.operators.proof`. See the
+[operator proof interface](docs/operator-proof.md) and
+[configuration example](docs/operator-proof.example.json) for authentication,
+TLS, read-only SQL fences, limits and required target-cluster qualification.
+This is an operation-bound helper for the API's synchronous executor.

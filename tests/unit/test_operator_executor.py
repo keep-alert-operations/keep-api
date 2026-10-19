@@ -254,6 +254,35 @@ def test_timeout_reconciles_same_ids_and_rewrites_redacted_secret(executor):
     assert len(writes) == 2 and writes[0][3]["uid"] == writes[1][3]["uid"]
 
 
+@pytest.mark.parametrize("activated", [False, True])
+def test_rotation_does_not_authenticate_old_credential_with_candidate_key(executor, activated):
+    adapter, remote, ledger, work = executor
+    current_id = str(uuid4())
+    document = json.loads(work.policy_document)
+    document["credentials"][current_id] = (
+        {"state": "retiring", "expires_at": (datetime.now(UTC) + timedelta(days=1)).timestamp()}
+        if activated else {"state": "current"}
+    )
+    if activated:
+        document["credentials"][work.candidate_id] = {"state": "current"}
+    rotation = replace(
+        work, kind="rotate", current_id=current_id,
+        policy_document=json.dumps(document, sort_keys=True, separators=(",", ":")),
+    )
+    ledger.valid_ids.add(current_id)
+    ledger.owned.add(("kong_key", current_id))
+    remote.keys[current_id] = {
+        "id": current_id, "key": "vena_" + "b" * 43,
+        "consumer": {"id": work.operator_id},
+    }
+    result = adapter.execute(rotation)
+    proofs = [body for host, _, _, body in remote.calls if host == "probe.test"]
+    assert result.credential_id == work.candidate_id
+    assert all(body["key"] is None for body in proofs if body["credential_id"] == current_id)
+    assert all(body["key"] == work.secret for body in proofs if body["credential_id"] == work.candidate_id)
+    assert all(body["expected_allowed"] is activated for body in proofs if body["credential_id"] == work.candidate_id)
+
+
 @pytest.mark.parametrize("restore_kind", ["cancel", "create_key"])
 def test_rename_and_cancel_restore_only_journaled_labels(executor, restore_kind):
     adapter, remote, ledger, work = executor

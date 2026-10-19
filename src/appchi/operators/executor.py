@@ -542,7 +542,9 @@ class _Attempt:
             "generation": str(self.work.generation),
             "nonce": nonce,
             "key": self.work.secret
-            if credential in (self.work.candidate_id, self.work.current_id)
+            # The attempt decrypts only the selected candidate/current key.
+            # During rotation it cannot authenticate the old key with that secret.
+            if credential == (self.work.candidate_id or self.work.current_id)
             else None,
             "policy_generation": str(self.work.policy_generation),
             "expected_allowed": bool(allowed),
