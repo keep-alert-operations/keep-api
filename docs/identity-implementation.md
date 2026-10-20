@@ -9,7 +9,7 @@ directory schema, credential, installed release or successful integration is imp
 
 ## Implemented boundaries
 
-- `backend/appchi/identity/oidc.py`: Authlib RS256 verification, exact issuer and
+- `src/appchi/identity/oidc.py`: Authlib RS256 verification, exact issuer and
   audience/authorized-party checks, nonce, authentication time and explicit password
   evidence; confidential code flow with S256 PKCE; unknown-key refresh once;
   signed backchannel logout; identity-preserving refresh; bounded HTTPS clients.
@@ -122,11 +122,11 @@ These are assistant-selected implementation details, not changes to product scop
 
 ## Tests and private-network qualification
 
-From the workspace root, after `uv sync --project backend --frozen --group dev`:
+From `appchi-api`, after `poetry check --lock` and `poetry sync --all-extras`:
 
 ```powershell
-backend/.venv/Scripts/python.exe -m pytest backend/tests/unit/test_identity_directory.py backend/tests/unit/test_identity_ldap.py backend/tests/unit/test_identity_oidc.py -q
-backend/.venv/Scripts/python.exe -m ruff check backend/appchi/identity backend/tests/unit/test_identity*.py
+poetry run python -m pytest tests/unit/test_identity_directory.py tests/unit/test_identity_ldap.py tests/unit/test_identity_oidc.py -q
+poetry run python -m ruff check src/appchi/identity tests/unit/test_identity*.py
 ```
 
 The adapter suite uses real Authlib RSA signatures and controlled HTTP/LDAP failure
@@ -139,7 +139,7 @@ and drop a uniquely named temporary database. They run all migrations and exerci
 the real production auth router and SQL transactions; only provider responses are
 controlled doubles. They do not modify shared company services.
 
-Executed locally: 42 adapter tests passed; 8 real PostgreSQL auth/publication tests
+Historical verification before the Poetry migration: 42 adapter tests passed; 8 real PostgreSQL auth/publication tests
 passed in an automatically created and removed database; identity Ruff checks
 passed. Windows `localhost` initially exceeded the three-second pool acquisition
 deadline during IPv6 fallback; the successful local run used `127.0.0.1` with a
@@ -147,7 +147,7 @@ two-second connection deadline. No company Keycloak/LDAP compatibility run occur
 
 ```powershell
 $env:APPCHI_IDENTITY_TEST_ADMIN_URL = '<isolated-test-cluster-admin-DSN>'
-backend/.venv/Scripts/python.exe -m pytest backend/tests/unit/test_identity_sessions.py -q
+poetry run python -m pytest tests/unit/test_identity_sessions.py -q
 ```
 
 On the private nonproduction deployment, record actual versions/configuration and
