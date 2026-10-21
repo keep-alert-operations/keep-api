@@ -149,16 +149,18 @@ def test_delete_holds_taken_row_locks_no_longer_than_the_statement_timeout(real_
     """A chain of short lock waits must not extend how long the DELETE holds a row.
 
     Each outside writer holds one published row for under the 200 ms lock_timeout
-    and releases it 150 ms after the previous one. Without a statement bound the
-    DELETE would hold its first row for the whole chain (about 750 ms).
+    and releases it 150 ms after the previous one. The releases start only after
+    the DELETE is seen holding a row, so without a statement bound it holds that
+    row for the whole chain (at least 750 ms) however slow the setup was.
     """
+    # A fresh heap holds the rows in insertion order (no updates, no reused line
+    # pointers), so a sequential scan reaches the free rows before the chain.
     with real_db.transaction() as conn:
-        conn.execute("DELETE FROM live_hint_outbox")
-        tenants = [create_tenant(conn) for _ in range(6)]
-    for tenant in tenants:
-        bump(real_db, tenant)
-    first, chain = tenants[0], tenants[1:]
+        conn.execute("TRUNCATE live_hint_outbox")
+        tenants = [create_tenant(conn) for _ in range(7)]
+    free, chain = tenants[:2], tenants[2:]
     before = pending(real_db)
+    assert set(before) == set(tenants)
     dsn = os.environ["APPCHI_TEST_DATABASE_URL"]
     lock = "SELECT 1 FROM live_hint_outbox WHERE tenant_id=%s FOR UPDATE"
 
@@ -198,13 +200,21 @@ def test_delete_holds_taken_row_locks_no_longer_than_the_statement_timeout(real_
             ).fetchone():
                 assert time.monotonic() < deadline, "the DELETE never waited on the chain"
                 time.sleep(0.002)
-            # The DELETE already holds the first published row.
-            with pytest.raises(psycopg.errors.LockNotAvailable):
-                other.execute(lock + " NOWAIT", (first,))
-            other.rollback()
+            # Find a published row the DELETE already holds, whatever its plan order.
+            held = None
+            for tenant in free:
+                try:
+                    other.execute(lock + " NOWAIT", (tenant,))
+                except psycopg.errors.LockNotAvailable:
+                    held = tenant
+                finally:
+                    other.rollback()
+                if held:
+                    break
+            assert held, "the DELETE held no free published row when it first waited"
             releaser.start()
             started = time.monotonic()
-            other.execute(lock, (first,))
+            other.execute(lock, (held,))
             waited = time.monotonic() - started
             other.rollback()
     finally:
