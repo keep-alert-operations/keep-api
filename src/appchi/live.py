@@ -262,24 +262,28 @@ class HintDeleteDeferred(Exception):
 
 # Below PostgreSQL's 1 s deadlock_timeout, so the optional hint delete yields to
 # multi-tenant view-state writers (rebuild cutover, bootstrap) instead of
-# deadlocking with them or stalling them.
-HINT_DELETE_LOCK_TIMEOUT = "200ms"
+# deadlocking with them or stalling them. lock_timeout bounds each lock wait;
+# the equal statement_timeout bounds the total time the DELETE can hold the row
+# locks it already took while it waits on a chain of briefly held rows.
+HINT_DELETE_TIMEOUT = "200ms"
 
 
 def delete_published(db, rows):
     """Delete exactly the published (tenant, generation) pairs in one statement.
 
     A newer invalidation committed during publication replaced the generation of
-    its tenant's row, so that row no longer matches and remains pending. When a
-    writer holds one of the rows, the whole delete gives up and every row stays
-    pending; the next turn republishes them, and hints are idempotent.
+    its tenant's row, so that row no longer matches and remains pending. When
+    writers hold the rows for longer than the timeout, the whole delete gives up
+    and every row stays pending; the next turn republishes them, and hints are
+    idempotent.
     Returns whether the delete ran.
     """
-    from psycopg.errors import LockNotAvailable
+    from psycopg.errors import LockNotAvailable, QueryCanceled
 
     try:
         with db.transaction(read_committed=True) as conn:
-            conn.execute(f"SET LOCAL lock_timeout = '{HINT_DELETE_LOCK_TIMEOUT}'")
+            conn.execute(f"SET LOCAL lock_timeout = '{HINT_DELETE_TIMEOUT}'")
+            conn.execute(f"SET LOCAL statement_timeout = '{HINT_DELETE_TIMEOUT}'")
             try:
                 conn.execute(
                     """DELETE FROM live_hint_outbox o
@@ -287,8 +291,8 @@ def delete_published(db, rows):
                     WHERE o.tenant_id=p.tenant_id AND o.generation=p.generation""",
                     ([row["tenant_id"] for row in rows], [row["generation"] for row in rows]),
                 )
-            except LockNotAvailable as error:
-                # Only this statement's lock wait is deferred; the unit rolls back.
+            except (LockNotAvailable, QueryCanceled) as error:
+                # Only this statement's timeouts are deferred; the unit rolls back.
                 raise HintDeleteDeferred() from error
     except HintDeleteDeferred:
         log.info("live_hint_delete_deferred")

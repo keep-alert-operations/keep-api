@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager
 import os
-from threading import Event
+from threading import Event, Thread
 import time
 from types import SimpleNamespace
 from uuid import uuid4
@@ -11,6 +11,7 @@ import psycopg
 import pytest
 
 from appchi.db import Database
+from appchi import live
 from appchi.live import publish_hints
 
 pytestmark = pytest.mark.integration
@@ -56,7 +57,10 @@ def pending(real_db):
     return {row["tenant_id"]: row["generation"] for row in rows}
 
 
-def test_batch_delete_removes_only_the_published_generations(real_db):
+def test_batch_delete_removes_only_the_published_generations(real_db, monkeypatch):
+    # Only stop may end this pass: on a loaded host the publisher's own commit can
+    # outlast the 1 s publication deadline and leave the second row unpublished.
+    monkeypatch.setattr(live, "time", SimpleNamespace(monotonic=lambda: 0.0))
     with real_db.transaction() as conn:
         conn.execute("DELETE FROM live_hint_outbox")
         tenants = [create_tenant(conn) for _ in range(3)]
@@ -139,3 +143,79 @@ def test_locked_published_row_defers_the_delete_within_the_lock_timeout(real_db)
         assert pending(real_db) == {}
     finally:
         database.close()
+
+
+def test_delete_holds_taken_row_locks_no_longer_than_the_statement_timeout(real_db):
+    """A chain of short lock waits must not extend how long the DELETE holds a row.
+
+    Each outside writer holds one published row for under the 200 ms lock_timeout
+    and releases it 150 ms after the previous one. Without a statement bound the
+    DELETE would hold its first row for the whole chain (about 750 ms).
+    """
+    with real_db.transaction() as conn:
+        conn.execute("DELETE FROM live_hint_outbox")
+        tenants = [create_tenant(conn) for _ in range(6)]
+    for tenant in tenants:
+        bump(real_db, tenant)
+    first, chain = tenants[0], tenants[1:]
+    before = pending(real_db)
+    dsn = os.environ["APPCHI_TEST_DATABASE_URL"]
+    lock = "SELECT 1 FROM live_hint_outbox WHERE tenant_id=%s FOR UPDATE"
+
+    holders = [psycopg.connect(dsn) for _ in chain]
+    for holder, tenant in zip(holders, chain):
+        holder.execute(lock, (tenant,))
+
+    def release_one_by_one():
+        for holder in holders:
+            time.sleep(0.15)
+            holder.rollback()
+
+    database = Database(dsn, deployment_epoch="test")
+    api = ApiDatabase(database)
+    outcome = {}
+
+    def publish():
+        publisher = SimpleNamespace(publish=lambda channel, data: None)
+        try:
+            outcome["published"] = publish_hints(
+                api, SimpleNamespace(environment="test"), publisher
+            )
+        except BaseException as error:  # Reported by the assertion below.
+            outcome["error"] = error
+
+    worker, releaser = Thread(target=publish), Thread(target=release_one_by_one)
+    try:
+        with (
+            psycopg.connect(dsn, autocommit=True) as monitor,
+            psycopg.connect(dsn) as other,
+        ):
+            worker.start()
+            deadline = time.monotonic() + 10
+            while not monitor.execute(
+                "SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid() "
+                "AND query LIKE 'DELETE FROM live_hint_outbox%' AND wait_event_type='Lock'"
+            ).fetchone():
+                assert time.monotonic() < deadline, "the DELETE never waited on the chain"
+                time.sleep(0.002)
+            # The DELETE already holds the first published row.
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                other.execute(lock + " NOWAIT", (first,))
+            other.rollback()
+            releaser.start()
+            started = time.monotonic()
+            other.execute(lock, (first,))
+            waited = time.monotonic() - started
+            other.rollback()
+    finally:
+        worker.join(10)
+        if releaser.ident:
+            releaser.join(10)
+        for holder in holders:
+            holder.close()
+        database.close()
+    assert "error" not in outcome and outcome["published"] == len(tenants)
+    # A blocked writer gets the row within the 200 ms statement bound, plus slack.
+    assert waited < 0.35
+    # The cancelled DELETE rolled back: every row stays pending for the next turn.
+    assert pending(real_db) == before

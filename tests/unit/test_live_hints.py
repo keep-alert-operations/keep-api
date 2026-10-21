@@ -6,7 +6,7 @@ from threading import Event
 from types import SimpleNamespace
 import time
 
-from psycopg.errors import LockNotAvailable
+from psycopg.errors import LockNotAvailable, QueryCanceled
 import pytest
 
 from appchi import live
@@ -103,7 +103,7 @@ async def test_empty_poll_still_backs_off(monkeypatch):
 
 
 class Database:
-    def __init__(self, rows, *, locked=False):
+    def __init__(self, rows, *, locked=None):
         self.rows = rows
         self.locked = locked
         self.units = []
@@ -127,10 +127,13 @@ class Database:
             self.settings.append(sql)
             return
         assert sql.startswith("DELETE")
-        # The lock timeout must be in force before the DELETE waits on a row.
-        assert self.settings == ["SET LOCAL lock_timeout = '200ms'"]
+        # Both timeouts must be in force before the DELETE waits on a row.
+        assert self.settings == [
+            "SET LOCAL lock_timeout = '200ms'",
+            "SET LOCAL statement_timeout = '200ms'",
+        ]
         if self.locked:
-            raise LockNotAvailable("canceling statement due to lock timeout")
+            raise self.locked("canceling statement due to timeout")
         self.deletes.append(params)
 
 
@@ -179,9 +182,10 @@ def test_nothing_published_deletes_nothing():
     assert database.units == [(None, True)]
 
 
-def test_locked_outbox_row_defers_the_delete_without_failing(caplog):
+@pytest.mark.parametrize("timeout", [LockNotAvailable, QueryCanceled])
+def test_locked_outbox_row_defers_the_delete_without_failing(timeout, caplog):
     caplog.set_level("INFO", logger="appchi.live")
-    database = Database(outbox(), locked=True)
+    database = Database(outbox(), locked=timeout)
     published = []
     publisher = SimpleNamespace(publish=lambda channel, data: published.append(channel))
     # Hints were sent; the delete yields to the lock holder and retries next turn.
