@@ -115,6 +115,9 @@ async def redis_listener(settings, registry):
 
 # Design section 20 requires reauthorization at least every 30 seconds.
 REAUTHORIZE_SECONDS = 15
+# A stream whose last successful authorization is this old ends. Every wait is
+# bounded by it and each send by 5 s, so nothing is sent after 30 seconds.
+AUTHORIZATION_LIMIT_SECONDS = 25
 
 
 def view_state(conn, tenant):
@@ -136,19 +139,25 @@ def state(request, tenant):
 def refresh(request, tenant, emitted, authorization_due):
     """Return (vector, reauthorized) for an open stream.
 
-    An unchanged fresh vector needs no transaction. A changed vector is never
-    returned unless this request was reauthorized in the same unit.
+    Only the stream that wins a due reconciliation opens a unit for it; others
+    wait on the registry without a pool connection. An unchanged vector needs no
+    transaction of its own. A changed vector is returned only after this
+    request is reauthorized.
     """
-    registry = request.app.state.live_registry
-    value = registry.cached(tenant)
-    if value is not None and value["view_generation"] == emitted and not authorization_due:
-        return value, False
-    with request_budget(10), request.app.state.db.transaction(tenant) as conn:
-        value = registry.read(tenant, lambda: view_state(conn, tenant))
-        if authorization_due or value["view_generation"] != emitted:
+    registry, db = request.app.state.live_registry, request.app.state.db
+    with request_budget(10):
+        if not authorization_due:
+
+            def load():
+                with db.transaction(tenant) as conn:
+                    return view_state(conn, tenant)
+
+            value = registry.read(tenant, load)
+            if value["view_generation"] == emitted:
+                return value, False
+        with db.transaction(tenant) as conn:
             authorize(conn, request, tenant)
-            return value, True
-        return value, False
+            return registry.read(tenant, lambda: view_state(conn, tenant)), True
 
 
 class BoundedStream(StreamingResponse):
@@ -191,9 +200,13 @@ async def events(tenant_id: str, request: Request):
         start = heartbeat
         authorized = opened
         value = current
+
+        def left():
+            return AUTHORIZATION_LIMIT_SECONDS - (time.monotonic() - authorized)
+
         try:
             while time.monotonic() - start < 1800:
-                if await request.is_disconnected():
+                if await request.is_disconnected() or left() <= 0:
                     return
                 event_id = f"{epoch}:{value['view_generation']}"
                 if previous != event_id:
@@ -206,17 +219,23 @@ async def events(tenant_id: str, request: Request):
                     )
                     yield f"id: {event_id}\nevent: {event}\ndata: {json.dumps(value, separators=(',', ':'))}\n\n"
                     previous = event_id
+                if left() <= 0:
+                    return
                 if time.monotonic() - heartbeat >= 15:
                     yield ": heartbeat\n\n"
                     heartbeat = time.monotonic()
+                if left() <= 0:
+                    return
                 with suppress(TimeoutError):
-                    await asyncio.wait_for(changed.wait(), timeout=2)
+                    await asyncio.wait_for(changed.wait(), timeout=min(2, left()))
                 changed.clear()
                 checked = time.monotonic()
                 due = checked - authorized >= REAUTHORIZE_SECONDS
                 try:
-                    value, reauthorized = await asyncio.to_thread(
-                        refresh, request, tenant_id, value["view_generation"], due
+                    # A slow unit cannot hold the stream open past the limit.
+                    value, reauthorized = await asyncio.wait_for(
+                        asyncio.to_thread(refresh, request, tenant_id, value["view_generation"], due),
+                        timeout=max(left(), 0),
                     )
                 except Exception:
                     return
