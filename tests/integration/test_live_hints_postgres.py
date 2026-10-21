@@ -3,9 +3,11 @@
 from contextlib import contextmanager
 import os
 from threading import Event
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
+import psycopg
 import pytest
 
 from appchi.db import Database
@@ -95,3 +97,45 @@ def test_batch_delete_removes_only_the_published_generations(real_db):
         concurrent: before[concurrent] + 1,
         unpublished: before[unpublished],
     }
+
+
+def test_locked_published_row_defers_the_delete_within_the_lock_timeout(real_db):
+    with real_db.transaction() as conn:
+        conn.execute("DELETE FROM live_hint_outbox")
+        tenants = [create_tenant(conn) for _ in range(2)]
+    for tenant in tenants:
+        bump(real_db, tenant)
+    before = pending(real_db)
+    assert set(before) == set(tenants)
+
+    class Publisher:
+        calls = []
+
+        def publish(self, channel, data):
+            self.calls.append(channel)
+
+    database = Database(os.environ["APPCHI_TEST_DATABASE_URL"], deployment_epoch="test")
+    api = ApiDatabase(database)
+    # A multi-tenant view-state writer holds one published row (as the 0020 trigger
+    # upsert would) until after the API's DELETE has given up.
+    with psycopg.connect(os.environ["APPCHI_TEST_DATABASE_URL"]) as writer:
+        writer.execute(
+            "SELECT 1 FROM live_hint_outbox WHERE tenant_id=%s FOR UPDATE", (tenants[1],)
+        )
+        started = time.monotonic()
+        try:
+            published = publish_hints(api, SimpleNamespace(environment="test"), Publisher())
+        finally:
+            elapsed = time.monotonic() - started
+            writer.rollback()
+    try:
+        assert published == 2 and len(Publisher.calls) == 2
+        # 200 ms lock timeout, far below the 2 s default and the 1 s deadlock_timeout.
+        assert elapsed < 1.5
+        # The statement is atomic: both rows stay pending for the next turn.
+        assert pending(real_db) == before
+        Publisher.calls.clear()
+        assert publish_hints(api, SimpleNamespace(environment="test"), Publisher()) == 2
+        assert pending(real_db) == {}
+    finally:
+        database.close()

@@ -256,16 +256,41 @@ def publish_hints(db, settings, client=None, *, stop=None):
             client.close()
 
 
+class HintDeleteDeferred(Exception):
+    """The published rows were locked by a writer; they stay pending."""
+
+
+# Below PostgreSQL's 1 s deadlock_timeout, so the optional hint delete yields to
+# multi-tenant view-state writers (rebuild cutover, bootstrap) instead of
+# deadlocking with them or stalling them.
+HINT_DELETE_LOCK_TIMEOUT = "200ms"
+
+
 def delete_published(db, rows):
     """Delete exactly the published (tenant, generation) pairs in one statement.
 
     A newer invalidation committed during publication replaced the generation of
-    its tenant's row, so that row no longer matches and remains pending.
+    its tenant's row, so that row no longer matches and remains pending. When a
+    writer holds one of the rows, the whole delete gives up and every row stays
+    pending; the next turn republishes them, and hints are idempotent.
+    Returns whether the delete ran.
     """
-    with db.transaction(read_committed=True) as conn:
-        conn.execute(
-            """DELETE FROM live_hint_outbox o
-            USING unnest(%s::uuid[],%s::bigint[]) AS p(tenant_id,generation)
-            WHERE o.tenant_id=p.tenant_id AND o.generation=p.generation""",
-            ([row["tenant_id"] for row in rows], [row["generation"] for row in rows]),
-        )
+    from psycopg.errors import LockNotAvailable
+
+    try:
+        with db.transaction(read_committed=True) as conn:
+            conn.execute(f"SET LOCAL lock_timeout = '{HINT_DELETE_LOCK_TIMEOUT}'")
+            try:
+                conn.execute(
+                    """DELETE FROM live_hint_outbox o
+                    USING unnest(%s::uuid[],%s::bigint[]) AS p(tenant_id,generation)
+                    WHERE o.tenant_id=p.tenant_id AND o.generation=p.generation""",
+                    ([row["tenant_id"] for row in rows], [row["generation"] for row in rows]),
+                )
+            except LockNotAvailable as error:
+                # Only this statement's lock wait is deferred; the unit rolls back.
+                raise HintDeleteDeferred() from error
+    except HintDeleteDeferred:
+        log.info("live_hint_delete_deferred")
+        return False
+    return True

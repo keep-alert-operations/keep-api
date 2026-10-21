@@ -6,6 +6,7 @@ from threading import Event
 from types import SimpleNamespace
 import time
 
+from psycopg.errors import LockNotAvailable
 import pytest
 
 from appchi import live
@@ -102,20 +103,34 @@ async def test_empty_poll_still_backs_off(monkeypatch):
 
 
 class Database:
-    def __init__(self, rows):
+    def __init__(self, rows, *, locked=False):
         self.rows = rows
+        self.locked = locked
         self.units = []
+        self.settings = []
         self.deletes = []
+        self.rolled_back = 0
 
     @contextmanager
     def transaction(self, tenant_id=None, *, read_committed=False):
         self.units.append((tenant_id, read_committed))
-        yield self
+        try:
+            yield self
+        except BaseException:
+            self.rolled_back += 1
+            raise
 
     def execute(self, sql, params=None):
         if sql.startswith("SELECT"):
             return SimpleNamespace(fetchall=lambda: list(self.rows))
+        if sql.startswith("SET LOCAL"):
+            self.settings.append(sql)
+            return
         assert sql.startswith("DELETE")
+        # The lock timeout must be in force before the DELETE waits on a row.
+        assert self.settings == ["SET LOCAL lock_timeout = '200ms'"]
+        if self.locked:
+            raise LockNotAvailable("canceling statement due to lock timeout")
         self.deletes.append(params)
 
 
@@ -162,3 +177,15 @@ def test_nothing_published_deletes_nothing():
     assert publish_hints(database, SETTINGS, SimpleNamespace(publish=None)) == 0
     assert database.deletes == []
     assert database.units == [(None, True)]
+
+
+def test_locked_outbox_row_defers_the_delete_without_failing(caplog):
+    caplog.set_level("INFO", logger="appchi.live")
+    database = Database(outbox(), locked=True)
+    published = []
+    publisher = SimpleNamespace(publish=lambda channel, data: published.append(channel))
+    # Hints were sent; the delete yields to the lock holder and retries next turn.
+    assert publish_hints(database, SETTINGS, publisher) == 3
+    assert len(published) == 3
+    assert database.deletes == [] and database.rolled_back == 1
+    assert "live_hint_delete_deferred" in caplog.text
