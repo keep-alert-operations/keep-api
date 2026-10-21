@@ -67,6 +67,7 @@ class LiveRegistry:
     def read(self, tenant, load):
         # Only worker threads wait for per-tenant loading. The registry lock
         # protects memory only; Redis callbacks never wait for database I/O.
+        # Callers must not hold a pool connection: load() takes its own.
         with self.lock:
             entry = self.entries.get(tenant)
         if entry is None:
@@ -76,13 +77,33 @@ class LiveRegistry:
                 if entry["expires"] > time.monotonic():
                     return entry["value"]
                 generation = entry["generation"]
-            value = load()
-            with self.lock:
+            return self._store(entry, load(), generation)
+
+    def fill(self, tenant, load):
+        """Like read(), for a caller holding a pool connection: never waits on load_lock."""
+        with self.lock:
+            entry = self.entries.get(tenant)
+            if entry is None:
+                generation = None
+            elif entry["expires"] > time.monotonic():
+                return entry["value"]
+            else:
+                generation = entry["generation"]
+        value = load()
+        return value if entry is None else self._store(entry, value, generation)
+
+    def _store(self, entry, value, generation):
+        with self.lock:
+            current = entry["value"]
+            # A slower concurrent read never replaces a newer vector.
+            if current is None or int(value["view_generation"]) >= int(
+                current["view_generation"]
+            ):
                 entry["value"] = value
-                # An invalidation during the SELECT must force another read.
-                if entry["generation"] == generation:
-                    entry["expires"] = time.monotonic() + 2
-            return value
+            # An invalidation during the SELECT must force another read.
+            if entry["generation"] == generation:
+                entry["expires"] = time.monotonic() + 2
+            return entry["value"]
 
 
 async def redis_listener(settings, registry):
@@ -133,16 +154,16 @@ def view_state(conn, tenant):
 def state(request, tenant):
     with request_budget(10), request.app.state.db.transaction(read_committed=True) as conn:
         authorize(conn, request, tenant)
-        return request.app.state.live_registry.read(tenant, lambda: view_state(conn, tenant))
+        return request.app.state.live_registry.fill(tenant, lambda: view_state(conn, tenant))
 
 
 def refresh(request, tenant, emitted, authorization_due):
     """Return (vector, reauthorized) for an open stream.
 
     Only the stream that wins a due reconciliation opens a unit for it; others
-    wait on the registry without a pool connection. An unchanged vector needs no
-    transaction of its own. A changed vector is returned only after this
-    request is reauthorized.
+    wait on the registry without a pool connection. Nothing waits on the
+    registry while holding one. An unchanged vector needs no transaction of its
+    own. A changed vector is returned only after this request is reauthorized.
     """
     registry, db = request.app.state.live_registry, request.app.state.db
     with request_budget(10):
@@ -157,7 +178,7 @@ def refresh(request, tenant, emitted, authorization_due):
                 return value, False
         with db.transaction(tenant) as conn:
             authorize(conn, request, tenant)
-            return registry.read(tenant, lambda: view_state(conn, tenant)), True
+            return registry.fill(tenant, lambda: view_state(conn, tenant)), True
 
 
 class BoundedStream(StreamingResponse):

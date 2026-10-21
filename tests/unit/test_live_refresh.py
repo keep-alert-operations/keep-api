@@ -275,3 +275,80 @@ async def test_slow_iterations_cannot_exceed_the_30_second_authorization_bound(m
     assert ended - opened <= 30
     # Only the open authorization succeeded; nothing waited on a later one.
     assert [at for at in stack.authorizations() if at < stack.revoked_at] == [opened]
+
+
+class PoolTimeout(Exception):
+    pass
+
+
+class Pool(Database):
+    """A pool of `size` connections with the API's 3 s acquire timeout."""
+
+    def __init__(self, log, size):
+        super().__init__(log)
+        self.free = threading.BoundedSemaphore(size)
+        self.timeouts = []
+
+    @contextmanager
+    def transaction(self, tenant_id=None, *, read_committed=False):
+        self.pool_wait()
+        if not self.free.acquire(timeout=3):
+            self.timeouts.append(threading.current_thread().name)
+            raise PoolTimeout()
+        try:
+            self.units.append((tenant_id, read_committed))
+            yield SimpleNamespace()
+        finally:
+            self.free.release()
+
+
+def test_due_streams_never_hold_connections_while_a_reload_waits_for_one(monkeypatch):
+    size = 4
+    stack = Stack(monkeypatch)
+    stack.db = stack.request.app.state.db = Pool(stack.log, size)
+    for _ in range(size + 1):
+        stack.registry.register(TENANT)
+    loading = threading.Event()
+
+    def pool_wait():
+        # The non-due winner holds load_lock and asks for a connection only
+        # after every due stream has taken one.
+        if threading.current_thread().name == "winner":
+            loading.set()
+            time.sleep(0.2)
+
+    def slow_authorize(conn, request, tenant):
+        time.sleep(0.3)
+
+    stack.db.pool_wait = pool_wait
+    monkeypatch.setattr(live, "authorize", slow_authorize)
+    results, errors = [], []
+
+    def wake(due):
+        try:
+            results.append(refresh(stack.request, TENANT, "1", due))
+        except Exception as error:
+            errors.append(error)
+
+    winner = threading.Thread(target=wake, args=(False,), name="winner")
+    winner.start()
+    assert loading.wait(2)
+    due = [threading.Thread(target=wake, args=(True,), name=f"due-{i}") for i in range(size)]
+    started = time.monotonic()
+    for thread in due:
+        thread.start()
+    for thread in [winner, *due]:
+        thread.join(10)
+    assert errors == [] and stack.db.timeouts == []
+    assert len(results) == size + 1
+    # Nobody sat out the 3 s acquire timeout.
+    assert time.monotonic() - started < 2
+
+
+def test_slower_concurrent_read_never_steps_the_cached_vector_back(monkeypatch):
+    stack = Stack(monkeypatch)
+    stack.registry.register(TENANT)
+    stack.registry.read(TENANT, lambda: {"view_generation": "7"})
+    stack.clock.now += 2
+    assert stack.registry.fill(TENANT, lambda: {"view_generation": "6"}) == {"view_generation": "7"}
+    assert stack.registry.cached(TENANT) == {"view_generation": "7"}
