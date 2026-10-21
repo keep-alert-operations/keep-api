@@ -148,10 +148,11 @@ def test_locked_published_row_defers_the_delete_within_the_lock_timeout(real_db)
 def test_delete_holds_taken_row_locks_no_longer_than_the_statement_timeout(real_db):
     """A chain of short lock waits must not extend how long the DELETE holds a row.
 
-    Each outside writer holds one published row for under the 200 ms lock_timeout
-    and releases it 150 ms after the previous one. The releases start only after
-    the DELETE is seen holding a row, so without a statement bound it holds that
-    row for the whole chain (at least 750 ms) however slow the setup was.
+    Each outside writer holds one published row for under the 200 ms lock_timeout:
+    the first releases as soon as the DELETE is seen holding a row, and each next
+    one 150 ms after the previous, so every later wait starts at a known time.
+    Without a statement bound the DELETE holds that row until the last release
+    (at least 600 ms), however slow the setup was.
     """
     # A fresh heap holds the rows in insertion order (no updates, no reused line
     # pointers), so a sequential scan reaches the free rows before the chain.
@@ -170,8 +171,8 @@ def test_delete_holds_taken_row_locks_no_longer_than_the_statement_timeout(real_
 
     def release_one_by_one():
         for holder in holders:
-            time.sleep(0.15)
             holder.rollback()
+            time.sleep(0.15)
 
     database = Database(dsn, deployment_epoch="test")
     api = ApiDatabase(database)
