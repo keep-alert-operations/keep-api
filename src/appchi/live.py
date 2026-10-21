@@ -57,6 +57,13 @@ class LiveRegistry:
                 entry["generation"] += 1
                 entry["event"].set()
 
+    def cached(self, tenant):
+        """Return the fresh coalesced vector, or None when a PostgreSQL read is due."""
+        with self.lock:
+            entry = self.entries.get(tenant)
+            if entry and entry["expires"] > time.monotonic():
+                return entry["value"]
+
     def read(self, tenant, load):
         # Only worker threads wait for per-tenant loading. The registry lock
         # protects memory only; Redis callbacks never wait for database I/O.
@@ -106,20 +113,42 @@ async def redis_listener(settings, registry):
             await asyncio.sleep(2)
 
 
+# Design section 20 requires reauthorization at least every 30 seconds.
+REAUTHORIZE_SECONDS = 15
+
+
+def view_state(conn, tenant):
+    return wire(
+        conn.execute(
+            """SELECT v.*,w.projection_seq AS committed_seq
+        FROM tenant_view_state v JOIN tenant_work_state w USING(tenant_id) WHERE tenant_id=%s""",
+            (tenant,),
+        ).fetchone()
+    )
+
+
 def state(request, tenant):
-    with request_budget(10), request.app.state.db.transaction() as conn:
+    with request_budget(10), request.app.state.db.transaction(read_committed=True) as conn:
         authorize(conn, request, tenant)
+        return request.app.state.live_registry.read(tenant, lambda: view_state(conn, tenant))
 
-        def load():
-            return wire(
-                conn.execute(
-                    """SELECT v.*,w.projection_seq AS committed_seq
-                FROM tenant_view_state v JOIN tenant_work_state w USING(tenant_id) WHERE tenant_id=%s""",
-                    (tenant,),
-                ).fetchone()
-            )
 
-        return request.app.state.live_registry.read(tenant, load)
+def refresh(request, tenant, emitted, authorization_due):
+    """Return (vector, reauthorized) for an open stream.
+
+    An unchanged fresh vector needs no transaction. A changed vector is never
+    returned unless this request was reauthorized in the same unit.
+    """
+    registry = request.app.state.live_registry
+    value = registry.cached(tenant)
+    if value is not None and value["view_generation"] == emitted and not authorization_due:
+        return value, False
+    with request_budget(10), request.app.state.db.transaction(tenant) as conn:
+        value = registry.read(tenant, lambda: view_state(conn, tenant))
+        if authorization_due or value["view_generation"] != emitted:
+            authorize(conn, request, tenant)
+            return value, True
+        return value, False
 
 
 class BoundedStream(StreamingResponse):
@@ -148,6 +177,7 @@ class BoundedStream(StreamingResponse):
 async def events(tenant_id: str, request: Request):
     registry = request.app.state.live_registry
     changed = registry.register(tenant_id)
+    opened = time.monotonic()
     try:
         current = await asyncio.to_thread(state, request, tenant_id)
     except BaseException:
@@ -159,6 +189,7 @@ async def events(tenant_id: str, request: Request):
         previous = None
         heartbeat = time.monotonic()
         start = heartbeat
+        authorized = opened
         value = current
         try:
             while time.monotonic() - start < 1800:
@@ -181,10 +212,16 @@ async def events(tenant_id: str, request: Request):
                 with suppress(TimeoutError):
                     await asyncio.wait_for(changed.wait(), timeout=2)
                 changed.clear()
+                checked = time.monotonic()
+                due = checked - authorized >= REAUTHORIZE_SECONDS
                 try:
-                    value = await asyncio.to_thread(state, request, tenant_id)
+                    value, reauthorized = await asyncio.to_thread(
+                        refresh, request, tenant_id, value["view_generation"], due
+                    )
                 except Exception:
                     return
+                if reauthorized:
+                    authorized = checked
         finally:
             pass  # Response cleanup also handles failure before the generator starts.
 
