@@ -126,7 +126,9 @@ async def redis_listener(settings, registry):
                             tenant = channel.removeprefix(prefix)
                             if channel.startswith(prefix) and str(UUID(tenant)) == tenant:
                                 registry.invalidate(tenant)
-                        await asyncio.sleep(0.05)
+                        if message is None:
+                            # Back off only on an empty poll; a burst drains back to back.
+                            await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -304,27 +306,72 @@ def publish_hints(db, settings, client=None, *, stop=None):
             socket_timeout=3,
             retry=Retry(NoBackoff(), 0),
         )
+    published = []
     try:
-        with db.transaction() as conn:
-            rows = conn.execute(
-                "SELECT * FROM live_hint_outbox ORDER BY updated_at,tenant_id LIMIT 100"
-            ).fetchall()
-        published = 0
-        deadline = time.monotonic() + 1
-        for row in rows:
-            if (stop is not None and stop.is_set()) or time.monotonic() >= deadline:
-                break
-            client.publish(
-                f"appchi.{settings.environment}.tenant.{row['tenant_id']}", str(row["generation"])
-            )
-            with db.transaction() as conn:
-                # A newer invalidation committed during publication remains pending.
-                conn.execute(
-                    "DELETE FROM live_hint_outbox WHERE tenant_id=%s AND generation=%s",
-                    (row["tenant_id"], row["generation"]),
+        try:
+            # Unscoped and never REPEATABLE READ: the restore guard runs in-transaction.
+            with db.transaction(read_committed=True) as conn:
+                rows = conn.execute(
+                    "SELECT * FROM live_hint_outbox ORDER BY updated_at,tenant_id LIMIT 100"
+                ).fetchall()
+            deadline = time.monotonic() + 1
+            for row in rows:
+                if (stop is not None and stop.is_set()) or time.monotonic() >= deadline:
+                    break
+                client.publish(
+                    f"appchi.{settings.environment}.tenant.{row['tenant_id']}",
+                    str(row["generation"]),
                 )
-            published += 1
-        return published
+                published.append(row)
+        finally:
+            # Also after a failed publish: rows already sent need no second hint.
+            if published:
+                delete_published(db, published)
+        return len(published)
     finally:
         if own_client:
             client.close()
+
+
+class HintDeleteDeferred(Exception):
+    """The published rows were locked by a writer; they stay pending."""
+
+
+# Below PostgreSQL's 1 s deadlock_timeout, so the optional hint delete yields to
+# multi-tenant view-state writers (rebuild cutover, bootstrap) instead of
+# deadlocking with them or stalling them. lock_timeout bounds each lock wait;
+# the equal statement_timeout bounds the total time the DELETE can hold the row
+# locks it already took while it waits on a chain of briefly held rows.
+HINT_DELETE_TIMEOUT = "200ms"
+
+
+def delete_published(db, rows):
+    """Delete exactly the published (tenant, generation) pairs in one statement.
+
+    A newer invalidation committed during publication replaced the generation of
+    its tenant's row, so that row no longer matches and remains pending. When
+    writers hold the rows for longer than the timeout, the whole delete gives up
+    and every row stays pending; the next turn republishes them, and hints are
+    idempotent.
+    Returns whether the delete ran.
+    """
+    from psycopg.errors import LockNotAvailable, QueryCanceled
+
+    try:
+        with db.transaction(read_committed=True) as conn:
+            conn.execute(f"SET LOCAL lock_timeout = '{HINT_DELETE_TIMEOUT}'")
+            conn.execute(f"SET LOCAL statement_timeout = '{HINT_DELETE_TIMEOUT}'")
+            try:
+                conn.execute(
+                    """DELETE FROM live_hint_outbox o
+                    USING unnest(%s::uuid[],%s::bigint[]) AS p(tenant_id,generation)
+                    WHERE o.tenant_id=p.tenant_id AND o.generation=p.generation""",
+                    ([row["tenant_id"] for row in rows], [row["generation"] for row in rows]),
+                )
+            except (LockNotAvailable, QueryCanceled) as error:
+                # Only this statement's timeouts are deferred; the unit rolls back.
+                raise HintDeleteDeferred() from error
+    except HintDeleteDeferred:
+        log.info("live_hint_delete_deferred")
+        return False
+    return True
