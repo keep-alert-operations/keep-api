@@ -396,6 +396,8 @@ def load_service():
 def main():
     import uvicorn
 
+    from appchi.api_http import BoundedHttpToolsProtocol
+
     try:
         service = load_service()
         cert, key = os.environ["APPCHI_PROOF_CERT_FILE"], os.environ["APPCHI_PROOF_KEY_FILE"]
@@ -403,7 +405,8 @@ def main():
     except Exception:
         raise SystemExit("Operator proof configuration is invalid.") from None
     uvicorn.run(create_app(service), host=os.getenv("APPCHI_BIND_HOST", "0.0.0.0"), port=port,
-                ssl_certfile=cert, ssl_keyfile=key, proxy_headers=False, access_log=False,
+                ssl_certfile=cert, ssl_keyfile=key, http=BoundedHttpToolsProtocol,
+                proxy_headers=False, access_log=False,
                 limit_concurrency=16, timeout_keep_alive=2, timeout_graceful_shutdown=5)
 
 

@@ -78,5 +78,6 @@ ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 APP
 RUN chgrp -R 0 /app && chmod -R g=rX /app
 USER 1001:0
 # Fail the build on missing Linux runtime libraries or an unusable native CEL wheel.
-RUN python -c "import appchi.main; from cel_expr_python import cel; assert cel.NewEnv().compile('true').return_type() == cel.Type.BOOL"
+# Also fail it when the native HTTP parser or event loop wheel is missing.
+RUN python -c "import appchi.main; import httptools, uvloop; from cel_expr_python import cel; assert cel.NewEnv().compile('true').return_type() == cel.Type.BOOL"
 CMD ["python", "-m", "appchi.api_cli"]
