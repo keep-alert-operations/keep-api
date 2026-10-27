@@ -45,7 +45,6 @@ def _preflight(request, tenant, window=None, body=None):
     ids(tenant, *([window] if window else []))
     with request.app.state.db.transaction() as conn:
         authorize(conn, request, tenant, "edit", mutation=True)
-        repo.require_ready(conn)
         previous = repo.get_window(conn, tenant, window) if window else None
     source = getattr(body, "cel", None) or (previous["cel"] if previous else None)
     return compiled(source)
@@ -65,7 +64,6 @@ def _save(request, tenant, body, window=None, enabled=None):
     )
     with request.app.state.db.transaction() as conn:
         actor, _, _ = authorize(conn, request, tenant, "edit", mutation=True)
-        repo.require_ready(conn)
         scope = f"{tenant}:{actor['id']}:maintenance:{window or 'create'}:{operation}"
         prior, fp = command_result(conn, scope, body.command_id, payload)
         if prior is not None:
@@ -670,9 +668,9 @@ def resume_delete(database, store, tenant_id, job_id, program, *, profile=None):
                     and ROLE_RANK.get(effective_role(conn, principal, job["tenant_id"]), 0) >= 2
                 )
                 gates = conn.execute(
-                    "SELECT capability,ready FROM capability_gates WHERE capability IN ('maintenance','recovery','human_auth') FOR SHARE"
+                    "SELECT capability,ready FROM capability_gates WHERE capability IN ('recovery','human_auth') FOR SHARE"
                 ).fetchall()
-                if len(gates) != 3 or not all(gate["ready"] for gate in gates):
+                if len(gates) != 2 or not all(gate["ready"] for gate in gates):
                     raise unavailable("maintenance_deletion_protection_unready")
                 if (
                     not authorized
@@ -763,7 +761,6 @@ def delete(tenant_id: str, window_id: str, request: Request):
     store = getattr(request.app.state, "recovery_store", None)
     with request.app.state.db.transaction() as conn:
         actor, _, _ = authorize(conn, request, tenant_id, "edit", mutation=True)
-        repo.require_ready(conn)
         scope = f"{tenant_id}:{actor['id']}:maintenance:{window_id}:delete"
         prior, fp = command_result(conn, scope, body.command_id, body.model_dump())
         if prior is not None:

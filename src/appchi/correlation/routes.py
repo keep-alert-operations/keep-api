@@ -116,7 +116,6 @@ def _save(request, tenant, body, rule_id=None, intent=None):
                 request.app.state.profile,
                 rule_id=rule_id,
                 enabled=enabled,
-                allow_local_preview=request.app.state.settings.environment == "development",
             )
         row, changed, reason = repo.persist(
             conn,
@@ -410,12 +409,9 @@ def detail(tenant_id: str, rule_id: str, request: Request, response: Response):
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         _, _, _, now = _snapshot(conn, request, tenant_id)
         row = repo.get_rule(conn, tenant_id, rule_id)
-        ready = conn.execute(
-            "SELECT ready FROM capability_gates WHERE capability='correlation'"
-        ).fetchone()["ready"]
         response.headers["ETag"] = '"' + str(row["revision"]) + '"'
         (data,) = enrich_actors(conn, [repo.public(row)])
-        return {"data": data, "meta": {"processing_ready": ready, "as_of": wire(now)}}
+        return {"data": data, "meta": {"as_of": wire(now)}}
 
 
 @router.get("/{rule_id}/history")
@@ -495,9 +491,6 @@ def diagnostics(
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         _, session, _, now = _snapshot(conn, request, tenant_id)
         row = repo.get_rule(conn, tenant_id, rule_id)
-        gate = conn.execute(
-            "SELECT ready FROM capability_gates WHERE capability='correlation'"
-        ).fetchone()["ready"]
         progress = conn.execute(
             "SELECT * FROM correlation_consumer_state WHERE tenant_id=%s", (tenant_id,)
         ).fetchone()
@@ -560,7 +553,6 @@ def diagnostics(
             "data": {
                 "health": row["health"],
                 "enabled": row["enabled"],
-                "processing_ready": gate,
                 "last_error": row["blocked_reason"],
                 "last_reset_reason": row["last_reset_reason"],
                 "epoch": str(row["epoch"]),

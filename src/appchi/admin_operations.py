@@ -113,9 +113,7 @@ def _proof_code(error):
     known = {
         "capacity_accounting_mismatch",
         "maintenance_proof_unavailable",
-        "maintenance_capacity_profile_required",
-        "maintenance_gate_changed",
-        "maintenance_gate_closed_with_timeline",
+        "capacity_profile_invalid",
         "clock_untrusted",
         "cel_unavailable",
         "correlation_runtime_unready",
