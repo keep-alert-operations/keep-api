@@ -18,10 +18,11 @@ from appchi.search.control import check_search
 from appchi.search.counts import CountQuery, CountReader, CountState
 from appchi.search.projection import canonical
 from appchi.search.reader import sort_spec
-from appchi.shared.display_names import AlertPage, documented, enrich_alerts
+from appchi.shared.display_names import AlertGroupPage, AlertPage, documented, enrich_alerts
 from appchi.shared.errors import AppError, unavailable
 from appchi.serialization import wire
 from appchi.search_clients import search_client
+from appchi.search_routes import grouped_response, requested_group
 
 router = APIRouter(prefix="/api/tenants/{tenant_id}", tags=["configuration"])
 
@@ -130,24 +131,22 @@ class DashboardPreview(DashboardDefinition):
         return self
 
 
-class PresetPreview(StrictModel):
+class _PresetSelection(StrictModel):
     preset_id: str | None = None
     expected_revision: str | None = None
     cel: str | None = Field(default=None, max_length=16384)
     sort: list[Sort] | None = Field(default=None, min_length=1, max_length=3)
     columns: list[str] | None = Field(default=None, min_length=1, max_length=30)
+    group_by: str | None = None
     q: str = Field(default="", max_length=256)
     include_suppressed: bool = False
-    limit: int = Field(default=50, ge=1, le=200)
-    cursor: str | None = Field(default=None, min_length=1, max_length=65536)
-    replace_cursor: str | None = Field(default=None, min_length=1, max_length=65536)
 
     @model_validator(mode="after")
     def selection(self):
         if self.preset_id is not None:
             uuid_string(self.preset_id)
             if self.expected_revision is None or any(
-                value is not None for value in (self.cel, self.sort, self.columns)
+                value is not None for value in (self.cel, self.sort, self.columns, self.group_by)
             ):
                 raise ValueError("Saved preview requires a revision and excludes candidate fields")
             Command.revision(self.expected_revision)
@@ -157,12 +156,34 @@ class PresetPreview(StrictModel):
             ):
                 raise ValueError("Candidate preview requires CEL, sort and columns")
             normalized = PresetDefinition(
-                name="Preview", cel=self.cel, sort=self.sort, columns=self.columns
+                name="Preview",
+                cel=self.cel,
+                sort=self.sort,
+                columns=self.columns,
+                group_by=self.group_by,
             )
             self.sort, self.columns = normalized.sort, normalized.columns
+        return self
+
+
+class PresetPreview(_PresetSelection):
+    limit: int = Field(default=50, ge=1, le=200)
+    cursor: str | None = Field(default=None, min_length=1, max_length=65536)
+    replace_cursor: str | None = Field(default=None, min_length=1, max_length=65536)
+    group_key: str | None = Field(default=None, max_length=1024)
+    group_empty: bool = False
+
+    @model_validator(mode="after")
+    def continuation(self):
         if self.cursor and self.replace_cursor:
             raise ValueError("Continue a cursor or replace it, not both")
         return self
+
+
+class PresetGroups(_PresetSelection):
+    group_limit: int = Field(default=10, ge=1, le=50)
+    rows_per_group: int = Field(default=5, ge=1, le=50)
+    group_cursor: str | None = Field(default=None, min_length=1, max_length=65536)
 
 
 def _budget(deadline):
@@ -360,8 +381,8 @@ class _DeadlineClient:
         return call
 
 
-@router.post("/presets/preview", responses=documented(AlertPage))
-def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
+def _preview_reader(request, tenant_id, body: _PresetSelection):
+    """Authorized saved-or-candidate definition, its snapshot scope and reader."""
     deadline = time.monotonic() + 10
     db, settings = request.app.state.db, request.app.state.settings
     with db.transaction() as conn:
@@ -374,13 +395,17 @@ def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
                 )
             if saved["profile"] != PROFILE:
                 raise unavailable("preset_profile_unavailable")
-            definition = {key: saved[key] for key in ("cel", "sort", "columns")}
+            definition = {key: saved[key] for key in ("cel", "sort", "columns", "group_by")}
         else:
             definition = {
                 "cel": body.cel,
                 "sort": [item.model_dump() for item in body.sort],
                 "columns": body.columns,
+                "group_by": body.group_by,
             }
+    if definition["group_by"] is None:
+        # Definitions without grouping keep their pre-REV-44 snapshot scope.
+        del definition["group_by"]
     expression = compile_expression(definition["cel"])
     order = []
     for item in definition["sort"]:
@@ -435,9 +460,8 @@ def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
                 )
             }
 
-    client = search_client(request)
     reader = SearchReader(
-        _DeadlineClient(client, deadline),
+        _DeadlineClient(search_client(request), deadline),
         settings.elasticsearch_index,
         settings.cipher(),
         clock=clock,
@@ -445,6 +469,15 @@ def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
         authorize=check,
         retained_ids=retained,
     )
+    return deadline, definition, expression, order, context, scope, reader
+
+
+@router.post("/presets/preview", responses=documented(AlertPage))
+def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
+    deadline, definition, expression, order, context, scope, reader = _preview_reader(
+        request, tenant_id, body
+    )
+    group = requested_group(definition.get("group_by"), body.group_key, body.group_empty)
     page = reader.page(
         expression,
         scope,
@@ -454,9 +487,10 @@ def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
         page_size=body.limit,
         cursor=body.cursor,
         replace_cursor=body.replace_cursor,
+        group=group,
     )
     _budget(deadline)
-    with db.transaction(tenant_id) as conn:
+    with request.app.state.db.transaction(tenant_id) as conn:
         # Read-time labels from PG; search documents never carry display names.
         items = enrich_alerts(conn, tenant_id, page.items)
     headers = {"ETag": '"' + body.expected_revision + '"'} if body.preset_id else {}
@@ -480,3 +514,38 @@ def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
         },
         headers=headers,
     )
+
+
+@router.post("/presets/preview/groups", responses=documented(AlertGroupPage))
+def preset_preview_groups(tenant_id: str, body: PresetGroups, request: Request):
+    """Grouped saved or candidate preview (REV-44); group rows continue through preview."""
+    deadline, definition, expression, order, context, scope, reader = _preview_reader(
+        request, tenant_id, body
+    )
+    group_by = definition.get("group_by")
+    if group_by is None:
+        raise AppError("grouping_required", "This definition has no grouping.", 422)
+    page = reader.groups(
+        expression,
+        scope,
+        group_by=group_by,
+        q=body.q,
+        include_suppressed=body.include_suppressed,
+        ordering=order,
+        group_limit=body.group_limit,
+        rows_per_group=body.rows_per_group,
+        group_cursor=body.group_cursor,
+    )
+    _budget(deadline)
+    with request.app.state.db.transaction(tenant_id) as conn:
+        result = grouped_response(conn, tenant_id, group_by, page)
+    result["meta"].update(
+        {
+            "observed": wire(page.observed),
+            "profile": PROFILE,
+            "applied": wire(context),
+            "relative": expression.relative,
+        }
+    )
+    headers = {"ETag": '"' + body.expected_revision + '"'} if body.preset_id else {}
+    return JSONResponse(result, headers=headers)

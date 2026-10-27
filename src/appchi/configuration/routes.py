@@ -54,7 +54,11 @@ def save(request, tenant, table, body, resource_id=None):
     with request.app.state.db.transaction() as conn:
         actor, _, _ = authorize(conn, request, tenant, "edit", mutation=True)
         scope = f"{tenant}:{actor['id']}:{table}:{resource_id or 'create'}"
-        prior, fp = command_result(conn, scope, body.command_id, body.model_dump())
+        payload = body.model_dump()
+        if table == "presets" and payload.get("group_by") is None:
+            # Commands sent before REV-44 had no group_by; their retries still match.
+            payload.pop("group_by", None)
+        prior, fp = command_result(conn, scope, body.command_id, payload)
         if prior is not None:
             return prior
         conn.execute(
@@ -108,13 +112,14 @@ def save(request, tenant, table, body, resource_id=None):
         )
         if table == "presets":
             conn.execute(
-                "INSERT INTO presets(id,tenant_id,name,name_key,revision,created_at,updated_at,created_by,updated_by,cel,profile,sort,columns) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,name_key=EXCLUDED.name_key,revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by,cel=EXCLUDED.cel,sort=EXCLUDED.sort,columns=EXCLUDED.columns",
+                "INSERT INTO presets(id,tenant_id,name,name_key,revision,created_at,updated_at,created_by,updated_by,cel,profile,sort,columns,group_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,name_key=EXCLUDED.name_key,revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by,cel=EXCLUDED.cel,sort=EXCLUDED.sort,columns=EXCLUDED.columns,group_by=EXCLUDED.group_by",
                 common
                 + (
                     body.cel,
                     "appchi-cel-v1",
                     Jsonb(definition["sort"]),
                     Jsonb(definition["columns"]),
+                    definition["group_by"],
                 ),
             )
         else:

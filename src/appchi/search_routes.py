@@ -1,14 +1,23 @@
 from datetime import timedelta
 from time import monotonic
+from typing import Literal
 
 from appchi.search.control import check_search
 from fastapi import APIRouter, Request
+from pydantic import Field
 
 from appchi.access import authorize
 from appchi.cel import compile_expression
-from appchi.search import SearchReader, SearchScope, SearchState
-from appchi.shared.display_names import AlertPage, documented, enrich_alerts
-from appchi.shared.errors import unavailable
+from appchi.models import StrictModel
+from appchi.search import GroupPage, SearchReader, SearchScope, SearchState
+from appchi.shared.display_names import (
+    AlertGroupPage,
+    AlertPage,
+    documented,
+    enrich_alerts,
+    group_labels,
+)
+from appchi.shared.errors import AppError, unavailable
 from appchi.serialization import wire
 from appchi.search_clients import search_client
 
@@ -137,6 +146,70 @@ class SearchSent:
         return getattr(self.client, name)
 
 
+def requested_group(group_by, group_key, group_empty):
+    """One group's rows (REV-44): a field with exactly one of its value or the empty group."""
+    if group_by is None:
+        if group_key is not None or group_empty:
+            raise AppError("invalid_group", "Group rows need group_by", 422)
+        return None
+    if (group_key is None) == (not group_empty):
+        raise AppError("invalid_group", "Give either group_key or group_empty", 422)
+    return (group_by, None if group_empty else group_key)
+
+
+def grouped_response(conn, tenant, group_by, page: GroupPage) -> dict:
+    """Group page body with read-time labels; rows are enriched in one batch."""
+    rows = [row for group in page.groups for row in group.items]
+    items = iter(enrich_alerts(conn, tenant, rows))
+    labels = group_labels(conn, tenant, group_by, [group.key for group in page.groups])
+
+    def counts(value):
+        return None if value is None else {key: str(count) for key, count in value.items()}
+
+    data = [
+        {
+            "key": group.key,
+            "label": labels.get(group.key) if group.key is not None else None,
+            "total": None if group.total is None else str(group.total),
+            "severity": counts(group.severity),
+            "status": counts(group.status),
+            "data": [next(items) for _ in group.items],
+            "next_cursor": group.next_cursor,
+        }
+        for group in page.groups
+    ]
+    return {
+        "data": data,
+        "meta": {
+            "total": None if page.total is None else str(page.total),
+            "group_count": str(page.group_count),
+            "group_by": group_by,
+            "evaluated_at": page.evaluated_at,
+            "updating": page.updating,
+            "watermark": wire(page.watermark),
+            "close_token": page.close_token,
+        },
+        "next_group_cursor": page.next_group_cursor,
+    }
+
+
+def _feed_reader(request, tenant_id):
+    settings = request.app.state.settings
+    units = FeedUnits(request, tenant_id)
+    principal, session = units.begin()
+    reader = SearchReader(
+        SearchSent(search_client(request), units),
+        settings.elasticsearch_index,
+        settings.cipher(),
+        clock=units.clock,
+        state=units.state,
+        authorize=units.check,
+        retained_ids=units.retained,
+    )
+    scope = SearchScope(tenant_id, bytes(session["handle_hash"]).hex(), settings.deployment_epoch)
+    return reader, scope
+
+
 @router.get("/api/tenants/{tenant_id}/alerts", responses=documented(AlertPage))
 def feed(
     tenant_id: str,
@@ -149,26 +222,17 @@ def feed(
     replace_cursor: str | None = None,
     sort: str = "timestamp",
     direction: str = "desc",
+    group_by: str | None = None,
+    group_key: str | None = None,
+    group_empty: bool = False,
 ):
-    settings = request.app.state.settings
     db = request.app.state.db
-    units = FeedUnits(request, tenant_id)
-    principal, session = units.begin()
+    reader, scope = _feed_reader(request, tenant_id)
+    group = requested_group(group_by, group_key, group_empty)
     expression = compile_expression(cel)
-
-    client = SearchSent(search_client(request), units)
-    reader = SearchReader(
-        client,
-        settings.elasticsearch_index,
-        settings.cipher(),
-        clock=units.clock,
-        state=units.state,
-        authorize=units.check,
-        retained_ids=units.retained,
-    )
     page = reader.page(
         expression,
-        SearchScope(tenant_id, bytes(session["handle_hash"]).hex(), settings.deployment_epoch),
+        scope,
         q=q,
         include_suppressed=include_suppressed,
         sort=sort,
@@ -176,6 +240,7 @@ def feed(
         page_size=limit,
         cursor=cursor,
         replace_cursor=replace_cursor,
+        group=group,
     )
     with db.transaction(tenant_id) as conn:
         # Read-time labels from PG; search documents never carry display names.
@@ -192,3 +257,38 @@ def feed(
         },
         "next_cursor": page.next_cursor,
     }
+
+
+class AlertGroupsRequest(StrictModel):
+    cel: str = Field(default="true", max_length=16384)
+    q: str = Field(default="", max_length=256)
+    include_suppressed: bool = False
+    sort: str = "timestamp"
+    direction: Literal["asc", "desc"] = "desc"
+    group_by: str
+    group_limit: int = Field(default=10, ge=1, le=50)
+    rows_per_group: int = Field(default=5, ge=1, le=50)
+    group_cursor: str | None = Field(default=None, min_length=1, max_length=65536)
+
+
+@router.post("/api/tenants/{tenant_id}/alerts/groups", responses=documented(AlertGroupPage))
+def feed_groups(tenant_id: str, body: AlertGroupsRequest, request: Request):
+    """Grouped first view of the Feed (REV-44); group rows continue through the feed."""
+    reader, scope = _feed_reader(request, tenant_id)
+    expression = compile_expression(body.cel)
+    page = reader.groups(
+        expression,
+        scope,
+        group_by=body.group_by,
+        q=body.q,
+        include_suppressed=body.include_suppressed,
+        sort=body.sort,
+        direction=body.direction,
+        group_limit=body.group_limit,
+        rows_per_group=body.rows_per_group,
+        group_cursor=body.group_cursor,
+    )
+    with request.app.state.db.transaction(tenant_id) as conn:
+        result = grouped_response(conn, tenant_id, body.group_by, page)
+    result["meta"]["relative"] = expression.relative
+    return result
