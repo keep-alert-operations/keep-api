@@ -64,7 +64,12 @@ def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request)
             return current_command_result(conn, result)
         _, now = coordinator(conn, tenant_id)
         lock_catalog(conn, catalog, targets=[alert_id])
-        from appchi.incidents.state import lock_linked_incidents, linked_transition
+        from appchi.incidents.state import (
+            became_resolved,
+            linked_transition,
+            lock_linked_incidents,
+            resolve_when_alerts_resolved,
+        )
 
         linked = lock_linked_incidents(conn, tenant_id, alert_id)
         row = retained(conn, tenant_id, alert_id, True)
@@ -90,6 +95,8 @@ def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request)
                 original_order=order,
                 maintenance_input_recorded=True,
             )
+            if became_resolved(row, updated):
+                resolve_when_alerts_resolved(conn, tenant_id, linked, now, catalog)
         flush_inline_effects(conn)
         updated = retained(conn, tenant_id, alert_id)
         result = {"data": wire(updated), "meta": {"revision": str(updated["revision"])}}
@@ -113,7 +120,11 @@ def bulk(tenant_id: str, body: BulkCommand, request: Request):
         _, now = coordinator(conn, tenant_id)
         selected = {item.alert_id: item.expected_revision for item in body.items}
         lock_catalog(conn, catalog, targets=selected)
-        from appchi.incidents.state import linked_transition
+        from appchi.incidents.state import (
+            became_resolved,
+            linked_transition,
+            resolve_when_alerts_resolved,
+        )
 
         linked_rows = conn.execute(
             "SELECT i.*,l.alert_id AS linked_alert_id FROM incidents i JOIN incident_alert_links l ON l.tenant_id=i.tenant_id AND l.incident_id=i.id WHERE l.tenant_id=%s AND l.alert_id=ANY(%s::uuid[]) AND l.unlinked_at IS NULL AND i.status<>'resolved' ORDER BY i.id FOR UPDATE OF i",
@@ -129,6 +140,7 @@ def bulk(tenant_id: str, body: BulkCommand, request: Request):
         if body.kind == "set_assignee":
             assignee(conn, tenant_id, body.value)
         results = {}
+        resolving = []
         for key, row in locked.items():
             updated, changed = apply_command(row, body.kind, body.value, actor["id"], now)
             updated, changed, effects, order = maintenance_adjust(
@@ -148,7 +160,11 @@ def bulk(tenant_id: str, body: BulkCommand, request: Request):
                     original_order=order,
                     maintenance_input_recorded=True,
                 )
+                if became_resolved(row, updated):
+                    resolving += linked_by_alert[key]
             results[key] = wire(updated)
+        # After the loop, so every selected alert is stored before siblings are read.
+        resolve_when_alerts_resolved(conn, tenant_id, resolving, now, catalog)
         flush_inline_effects(conn)
         results = {key: wire(retained(conn, tenant_id, key)) for key in selected}
         return current_command_result(
