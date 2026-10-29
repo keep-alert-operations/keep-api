@@ -2,6 +2,12 @@ from uuid import uuid4
 from fastapi import APIRouter, Request
 
 from appchi.access import assignee, authorize
+from appchi.alerts.dismissal import (
+    dismissal_reason,
+    dismissal_recorded,
+    dismissal_view,
+    effective_suppressed,
+)
 from appchi.alerts.lifecycle import apply_command
 from appchi.alerts.repository import publish, store_alert
 from appchi.models import AlertCommand, BulkCommand, NoteCommand, Command
@@ -51,8 +57,50 @@ def detail(tenant_id: str, alert_id: str, request: Request):
         return {"data": labelled, "meta": {"revision": str(row["revision"])}}
 
 
+def insert_note(conn, tenant, alert_id, note_id, text, deleted, note_revision, actor, now, occurrence):
+    conn.execute(
+        "INSERT INTO alert_notes(id,tenant_id,alert_id,text,deleted,revision,actor_id,created_at,occurrence_id,actor_display_name) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET text=EXCLUDED.text,deleted=EXCLUDED.deleted,revision=EXCLUDED.revision",
+        (
+            note_id,
+            tenant,
+            alert_id,
+            text,
+            deleted,
+            note_revision,
+            actor["id"],
+            now,
+            occurrence,
+            actor["display_name"],
+        ),
+    )
+    conn.execute(
+        "INSERT INTO alert_note_revisions(tenant_id,alert_id,note_id,revision,text,deleted,actor_id,recorded_at,actor_display_name) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (
+            tenant,
+            alert_id,
+            note_id,
+            note_revision,
+            text,
+            deleted,
+            actor["id"],
+            now,
+            actor["display_name"],
+        ),
+    )
+
+
+def command_view(row, now):
+    """Command responses show suppression and dismissal at the command's clock (REV-49)."""
+    return wire(
+        dict(row, suppressed=effective_suppressed(row, now), dismissal=dismissal_view(row, now))
+    )
+
+
 @router.post("/{alert_id}/commands")
 def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request):
+    if body.kind == "set_dismissal" and not request.app.state.settings.alert_dismissal_enabled:
+        # Stays off until every writer runs a release that understands dismissals.
+        raise AppError("dismissal_disabled", "Dismissing alerts is not enabled yet.", 422)
     catalog = request_catalog(request, tenant_id, alert_id=alert_id)
     with request.app.state.db.transaction() as conn:
         actor, _, _ = authorize(conn, request, tenant_id, "edit", mutation=True)
@@ -78,6 +126,14 @@ def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request)
         if body.kind == "set_assignee":
             assignee(conn, tenant_id, body.value)
         updated, changed = apply_command(row, body.kind, body.value, actor["id"], now)
+        reason = dismissal_reason(body.value) if body.kind == "set_dismissal" else None
+        if changed and reason and dismissal_recorded(updated):
+            # The optional reason becomes an ordinary note in the same transaction,
+            # before publication so the projection carries it.
+            insert_note(
+                conn, tenant_id, alert_id, str(uuid4()), reason, False, 1, actor, now,
+                row["occurrence_id"],
+            )
         updated, changed, effects, order = maintenance_adjust(
             conn, row, updated, now, body.kind, catalog
         )
@@ -99,7 +155,7 @@ def command(tenant_id: str, alert_id: str, body: AlertCommand, request: Request)
                 resolve_when_alerts_resolved(conn, tenant_id, linked, now, catalog)
         flush_inline_effects(conn)
         updated = retained(conn, tenant_id, alert_id)
-        result = {"data": wire(updated), "meta": {"revision": str(updated["revision"])}}
+        result = {"data": command_view(updated, now), "meta": {"revision": str(updated["revision"])}}
         return current_command_result(
             conn,
             save_result(
@@ -210,34 +266,9 @@ def mutate_note(conn, request, tenant, alert_id, body, note_id=None, delete=Fals
     note_id = note_id or str(uuid4())
     if changed:
         note_revision = previous["revision"] + 1 if previous else 1
-        conn.execute(
-            "INSERT INTO alert_notes(id,tenant_id,alert_id,text,deleted,revision,actor_id,created_at,occurrence_id,actor_display_name) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET text=EXCLUDED.text,deleted=EXCLUDED.deleted,revision=EXCLUDED.revision",
-            (
-                note_id,
-                tenant,
-                alert_id,
-                text,
-                delete,
-                note_revision,
-                actor["id"],
-                now,
-                row["occurrence_id"],
-                actor["display_name"],
-            ),
-        )
-        conn.execute(
-            "INSERT INTO alert_note_revisions(tenant_id,alert_id,note_id,revision,text,deleted,actor_id,recorded_at,actor_display_name) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                tenant,
-                alert_id,
-                note_id,
-                note_revision,
-                text,
-                delete,
-                actor["id"],
-                now,
-                actor["display_name"],
-            ),
+        insert_note(
+            conn, tenant, alert_id, note_id, text, delete, note_revision, actor, now,
+            row["occurrence_id"],
         )
         updated = {
             **row,

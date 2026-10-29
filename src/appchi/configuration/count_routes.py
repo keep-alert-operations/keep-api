@@ -82,6 +82,7 @@ def quick_counts(tenant_id: str, body: QuickCountRequest, request: Request):
             "watermark": batch.watermark,
             "observed": batch.observed,
             "updating": batch.updating,
+            "next_change_at": batch.next_change_at,
         },
         "meta": {"profile": PROFILE},
     }
@@ -341,6 +342,7 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
         "observed": batch.observed,
         "updating": batch.updating,
         "updating_suppression": batch.updating_suppression,
+        "next_change_at": batch.next_change_at,
         "panels": [
             {
                 "panel_id": str(panel["id"]),
@@ -508,6 +510,7 @@ def preset_preview(tenant_id: str, body: PresetPreview, request: Request):
                     "applied": context,
                     "relative": expression.relative,
                     "close_token": page.close_token,
+                    "next_change_at": page.next_change_at,
                 }
             ),
             "next_cursor": page.next_cursor,

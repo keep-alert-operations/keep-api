@@ -1,5 +1,6 @@
 """ES response/transport control-flow tests, not an Elasticsearch substitute."""
 
+from appchi.cel.compiler import negate, suppressed_query
 from dataclasses import replace
 from datetime import UTC, datetime
 import time
@@ -79,7 +80,9 @@ def test_same_pit_clock_exact_totals_dedup_and_pre_snapshot_watermark(expression
         assert body["size"] == 0 and body["track_total_hits"] is True
         assert "index" not in body and "routing" not in body and "preference" not in body
         assert {"term": {"tenant_id": "tenant-a"}} in body["query"]["bool"]["filter"]
-        assert {"term": {"suppressed": False}} in body["query"]["bool"]["filter"]
+        # Requirements: REV-49; alert operations 25, 29. Dismissals hide rows at NOW.
+        assert negate(suppressed_query(NOW)) in body["query"]["bool"]["filter"]
+        assert body["aggs"]["next_change"]["global"] == {}
         assert {"term": {"deleted": False}} in body["query"]["bool"]["filter"]
     assert searches[3]["query"] == expressions["recent"].scoped_query("tenant-a", NOW)
     assert set(client.closed) == {"initial", "replacement", "replacement-2"}
