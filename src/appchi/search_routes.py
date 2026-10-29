@@ -188,6 +188,7 @@ def grouped_response(conn, tenant, group_by, page: GroupPage) -> dict:
             "updating": page.updating,
             "watermark": wire(page.watermark),
             "close_token": page.close_token,
+            "next_change_at": page.next_change_at,
         },
         "next_group_cursor": page.next_group_cursor,
     }
@@ -254,6 +255,7 @@ def feed(
             "watermark": wire(page.watermark),
             "relative": expression.relative,
             "close_token": page.close_token,
+            "next_change_at": page.next_change_at,
         },
         "next_cursor": page.next_cursor,
     }
