@@ -238,9 +238,11 @@ def test_openapi_publishes_optional_display_fields_for_changed_reads():
         "operator_display_name",
         "display_status",
         "active_incident_title",
+        # REV-49: the timed dismissal end, already reflected in `suppressed`.
+        "dismissed_until",
     }
     detail = schemas["AlertRead"]["properties"]["data"]["$ref"].rsplit("/", 1)[1]
-    assert set(schemas[detail]["properties"]) == set(alert["properties"]) | {"active_incident_id"}
+    assert set(schemas[detail]["properties"]) == set(alert["properties"]) | {"active_incident_id", "dismissal"}
     assert "required" not in schemas[detail]
     assert set(schemas["IncidentDisplayNames"]["properties"]) == {
         "assignee_display_name",
