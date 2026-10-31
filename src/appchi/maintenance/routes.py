@@ -581,7 +581,7 @@ def affected_alerts(
             clauses.append("c.alert_id>%s")
             params.append(codec.decode(cursor)["position"])
         rows = conn.execute(
-            """SELECT DISTINCT c.alert_id,a.tenant_id,a.message,a.status,a.severity,a.assignee_id,(a.id IS NULL) AS unavailable
+            """SELECT DISTINCT c.alert_id,a.tenant_id,a.schema_version,a.key_field,a.name,a.message,a.status,a.severity,a.assignee_id,(a.id IS NULL) AS unavailable
              FROM alert_maintenance_causes c JOIN maintenance_segments s ON s.tenant_id=c.tenant_id AND s.id=c.segment_id
              LEFT JOIN alert_identities i ON i.tenant_id=c.tenant_id AND i.id=c.alert_id AND i.retired_at IS NULL
              LEFT JOIN alerts a ON a.tenant_id=i.tenant_id AND a.id=i.id WHERE """
