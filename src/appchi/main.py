@@ -142,6 +142,9 @@ def create_app(settings=None, db=None):
 
     app.include_router(operators)
     app.include_router(incidents)
+    from appchi.reports.incidents import router as reports
+
+    app.include_router(reports)
     app.include_router(tenants)
     from appchi.identity.selection import router as directory_selection
 
