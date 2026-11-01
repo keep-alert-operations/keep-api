@@ -248,6 +248,10 @@ def test_openapi_publishes_optional_display_fields_for_changed_reads():
         "assignee_display_name",
         "origin_rule_id",
         "origin_rule_name",
+        # REV-56: link counts, on list rows as well as the detail.
+        "total_linked",
+        "suppressed",
+        "unavailable",
     }
     assert set(schemas["ActorDisplayNames"]["properties"]) == {
         "created_by_display_name",
