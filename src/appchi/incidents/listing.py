@@ -6,6 +6,7 @@ from uuid import UUID
 
 from appchi.access import authorize
 from appchi.identity.cleanup import visible_assignee
+from appchi.incidents.counts import page_linked_counts
 from appchi.shared.cursors import Cursor
 from appchi.shared.display_names import enrich_incidents
 from appchi.shared.errors import AppError
@@ -138,11 +139,13 @@ def list_incidents(request, tenant_id, *, terms, limit, cursor, **query):
             if len(rows) > limit
             else None
         )
+        counts = page_linked_counts(conn, tenant_id, [item["id"] for item in rows[:limit]])
         for item in rows[:limit]:
             item.pop("sort_value")
             item["assignee_id"], item["assignment_cleanup_pending"] = visible_assignee(
                 conn, tenant_id, item["assignee_id"]
             )
+            item.update(counts[str(item["id"])])
         return {
             "data": enrich_incidents(conn, tenant_id, wire(rows[:limit])),
             "meta": {},
