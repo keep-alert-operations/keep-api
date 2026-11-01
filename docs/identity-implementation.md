@@ -157,8 +157,10 @@ execute the full [identity acceptance list](https://github.com/appchi-alert-oper
    replay rejection, same-origin CSRF, cookie properties and protected mapper rules.
 2. Full direct/nested/cyclic/alternate-path and primary-group membership; disabled
    and recreated users; immutable rename behavior; unknown-user evidence denial.
-3. Paged LDAP failure, inaccessible subtrees and directory visibility delay. Measure
-   source change to open API/SSE revocation against the five-minute target.
+3. Paged LDAP failure, inaccessible subtrees and directory visibility delay. Verify
+   that an explicit `directory --once` publication of a source change revokes open
+   API/SSE access; the five-minute automatic propagation target is deferred with
+   the directory worker (REV-35).
 4. Keycloak and LDAP independent outages, valid cached sessions without an identity
    age cutoff, new-user admission restrictions and verified recovery publication.
 5. Concurrent tab refresh, rotation crash/ambiguity, signed logout replay and racing

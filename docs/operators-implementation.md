@@ -259,10 +259,14 @@ Ruff check passed for the changed implementation and test files.
 Frontend typecheck and a focused Chromium test passed for creating a replacement
 while revoked-key cleanup is pending; Copy remains unavailable until activation.
 
+That run used the monorepo layout. The executor tests now live in this repository
+and the repository/ledger tests in delivery; rerun them with:
+
 ```powershell
-backend/.venv/Scripts/python.exe -m pytest backend/tests/unit/test_operator_executor.py -q
-# Set APPCHI_TEST_DATABASE_URL to an isolated migrated test database:
-backend/.venv/Scripts/python.exe -m pytest backend/tests/integration/test_operator_repository.py backend/tests/integration/test_operator_executor_ledger.py -q
+# From appchi-api, after poetry sync --all-extras:
+poetry run python -m pytest tests/unit/test_operator_executor.py -q
+# From appchi-delivery, with APPCHI_TEST_DATABASE_URL set to an isolated migrated test database:
+.venv/Scripts/python.exe -m pytest tests/integration/test_operator_repository.py tests/integration/test_operator_executor_ledger.py -q
 ```
 
 Before enabling the profile, execute the operator verification-plan scenarios
