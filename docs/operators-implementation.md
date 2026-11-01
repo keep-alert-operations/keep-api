@@ -1,9 +1,10 @@
 # Operator implementation and supplied-platform binding
 
-The application now has durable operator APIs, encrypted key state, a leased SQL
-provisioning queue, and an executable HTTPS Grafana/Kong adapter. Private company
-compatibility and readiness remain unqualified. No company Grafana receiver,
-policy, rule, Kong Consumer or key was changed during this implementation.
+The application now has durable operator APIs, encrypted key state, request-owned
+provisioning with durable SQL operation progress, and an executable HTTPS
+Grafana/Kong adapter. Private company compatibility and readiness remain
+unqualified. No company Grafana receiver, policy, rule, Kong Consumer or key was
+changed during this implementation.
 
 ## Implemented paths
 
@@ -14,12 +15,26 @@ operator generations fence stale completion. Copy is a separately authorized,
 audited response; ciphertext and secrets never appear in list/history payloads.
 Revocation immediately erases ciphertext and authoritative admission eligibility.
 
-`operators/worker.py` claims a 45-second operation lease and global Grafana writer
-lease. `operators/executor.py` makes external calls outside SQL transactions,
-with a 27-second attempt budget and bounded response sizes. `executor_ledger.py`
-checks the operation token, both lease deadlines, generation and operator revision
-before and after HTTP calls. It pins the supplied profile digest per operator and
-persists only reversible routing-label edits, never key material or rule bodies.
+Provisioning is request-owned (REV-34; [worker scope 3](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-worker-scope.md#3-request-owned-operator-provisioning)).
+No operator worker or background retry loop runs. The API commits the command and
+its operation first; `operators/synchronous.py` then runs that operation inside the
+same HTTP request, within a 90-second budget that starts no attempt with less than
+35 seconds left. Creation returns 201, and other provisioning mutations 200, only
+after verified completion. A failed or incomplete request returns 503 (or an
+applicable 409, such as a cancelled or superseded operation) with the operator and
+operation IDs, `outcome_may_be_partial: true` and `retry_action: "retry"`. Partial
+progress stays for the explicit retry endpoint; replaying the original command
+inspects its original operation and never creates another key. A restart or
+disconnected caller leaves recoverable progress but schedules no continuation.
+
+For each attempt, `run_one` in `operators/worker.py` (the module keeps the deferred
+worker's name) claims that operation's 45-second lease and the global Grafana writer
+lease; a competing request never steals a held lease. `operators/executor.py` makes
+external calls outside SQL transactions, with a 27-second attempt budget and
+bounded response sizes. `executor_ledger.py` checks the operation token, both lease
+deadlines, generation and operator revision before and after HTTP calls. It pins
+the supplied profile digest per operator and persists only reversible routing-label
+edits, never key material or rule bodies.
 A durable resource-creation intent is recorded after confirmed absence and before
 the first remote write. A preexisting same-UUID Consumer or receiver without that
 ownership record is a conflict; a reserved name alone does not permit adoption.
@@ -58,11 +73,12 @@ fields `restoring_cancellation` and `cancellation_kind` let the UI explain this 
 
 Deletion removes exact old/proposed routing labels, the owned managed policy
 entries and receiver, checks for direct receiver references, and verifies absence
-before the SQL worker may logically retire the operator. Retained-alert and pending
-input eligibility are rechecked at commit. Only then are remaining keys revoked,
-name claims released and durable Kong cleanup scheduled. Cleanup refuses to delete
-a Consumer with untracked credentials. Local authoritative admission rejects a
-retired or revoked identity while remote cleanup is pending.
+before the completion transaction may logically retire the operator. Retained-alert
+and pending input eligibility are rechecked at commit. Only then are remaining keys
+revoked, name claims released and a durable Kong cleanup operation recorded, which
+the same request continues. Cleanup refuses to delete a Consumer with untracked
+credentials. Local authoritative admission rejects a retired or revoked identity
+while remote cleanup is pending.
 
 ## Supported executable profile
 
@@ -148,32 +164,36 @@ the supplied account and organization, without silent pagination/truncation.
 
 Credentials are separate from this nonsecret binding: Grafana service-account
 Bearer token, Kong Admin `Kong-Admin-Token`, and a distinct proof-service Bearer
-token. Supply them through the deployment secret mechanism and instantiate:
+token. Supply them through the deployment secret mechanism. For each provisioning
+request, `operators/synchronous.py` instantiates the adapter:
 
 ```python
-from pathlib import Path
 from appchi.operators.executor import configured_executor, PlatformCredentials
 
 adapter = configured_executor(
-    Path(binding_file), database,
+    settings.operator_binding, operator_db,
     PlatformCredentials(grafana_token, kong_token, probe_token),
+    settings=settings,
 )
-# Pass adapter to operators.worker.run_one(database, envelope_cipher, adapter).
-# Close adapter on worker shutdown.
+# The request passes adapter to operators.worker.run_one(operator_db,
+# envelope_cipher, adapter, tenant=..., operation_id=...) for its own
+# operation only, then closes the adapter.
 ```
 
-The factory provides `.manifest`, `.execute(Work)` and `.close()`. Missing or
-unsupported binding/capabilities leave provisioning unready. API workers need
-neither these management credentials nor operator key decryption access.
+The factory provides `.manifest`, `.execute(Work)` and `.close()`. A missing or
+unsupported binding or capability fails the provisioning request with 503;
+unrelated APIs are unaffected.
 
-The `operators` worker role wires this factory using `APPCHI_OPERATOR_BINDING`
-(the JSON file path), `APPCHI_OPERATOR_GRAFANA_TOKEN`, `APPCHI_OPERATOR_KONG_TOKEN`
-and `APPCHI_OPERATOR_PROBE_TOKEN`, alongside the normal database/envelope-key
-settings. Supply secrets through the platform mechanism, without shell tracing.
-
-```powershell
-backend/.venv/Scripts/python.exe -m appchi.worker operators
-```
+The Product API mounts the binding and management credentials. It wires this
+factory from `APPCHI_OPERATOR_BINDING` (the JSON file path),
+`APPCHI_OPERATOR_DATABASE_URL`, `APPCHI_OPERATOR_GRAFANA_TOKEN`,
+`APPCHI_OPERATOR_KONG_TOKEN` and `APPCHI_OPERATOR_PROBE_TOKEN`, alongside the
+normal database/envelope-key settings. The operator database URL uses the
+provisioning-role privileges through one shared connection per API process;
+ordinary API SQL keeps its RLS connection. Never mount these credentials into
+ingress or frontend. Supply secrets through the platform mechanism, without shell
+tracing. There is no operator worker to start: the `operators` role is deferred
+(REV-34) and `appchi.worker` rejects it.
 
 ## Private readiness proof contract and security
 
