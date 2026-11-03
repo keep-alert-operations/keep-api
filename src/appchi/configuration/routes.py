@@ -58,6 +58,9 @@ def save(request, tenant, table, body, resource_id=None):
         if table == "presets" and payload.get("group_by") is None:
             # Commands sent before REV-44 had no group_by; their retries still match.
             payload.pop("group_by", None)
+        if table == "presets" and payload.get("noisy") is False:
+            # Likewise for commands sent before REV-58 had the alarm flag.
+            payload.pop("noisy", None)
         prior, fp = command_result(conn, scope, body.command_id, payload)
         if prior is not None:
             return prior
@@ -112,7 +115,7 @@ def save(request, tenant, table, body, resource_id=None):
         )
         if table == "presets":
             conn.execute(
-                "INSERT INTO presets(id,tenant_id,name,name_key,revision,created_at,updated_at,created_by,updated_by,cel,profile,sort,columns,group_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,name_key=EXCLUDED.name_key,revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by,cel=EXCLUDED.cel,sort=EXCLUDED.sort,columns=EXCLUDED.columns,group_by=EXCLUDED.group_by",
+                "INSERT INTO presets(id,tenant_id,name,name_key,revision,created_at,updated_at,created_by,updated_by,cel,profile,sort,columns,group_by,noisy) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,name_key=EXCLUDED.name_key,revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by,cel=EXCLUDED.cel,sort=EXCLUDED.sort,columns=EXCLUDED.columns,group_by=EXCLUDED.group_by,noisy=EXCLUDED.noisy",
                 common
                 + (
                     body.cel,
@@ -120,6 +123,7 @@ def save(request, tenant, table, body, resource_id=None):
                     Jsonb(definition["sort"]),
                     Jsonb(definition["columns"]),
                     definition["group_by"],
+                    definition["noisy"],
                 ),
             )
         else:
