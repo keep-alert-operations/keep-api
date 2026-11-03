@@ -10,7 +10,7 @@ from pydantic import Field, field_validator, model_validator
 from appchi.access import authorize
 from appchi.cel import compile_expression
 from appchi.cel.compiler import PROFILE
-from appchi.configuration.models import DashboardDefinition, PresetDefinition, Sort
+from appchi.configuration.models import DashboardDefinition, PresetDefinition, Sort, presets_of
 from appchi.configuration.routes import get_definition
 from appchi.models import Command, StrictModel, uuid_string
 from appchi.search import SearchReader, SearchScope, SearchState
@@ -127,7 +127,7 @@ class DashboardPreview(DashboardDefinition):
 
     @model_validator(mode="after")
     def referenced(self):
-        if set(self.preset_revisions) != {panel.preset_id for panel in self.panels}:
+        if set(self.preset_revisions) != set(presets_of(self.panels)):
             raise ValueError("Supply exactly the referenced preset revisions")
         return self
 
@@ -276,6 +276,8 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
         panels = (
             dashboard["panels"] if dashboard else [panel.model_dump() for panel in candidate.panels]
         )
+        # Only count panels are counted; other panel types reference no preset (REV-57).
+        panels = [panel for panel in panels if panel["type"] == "count"]
         if len(panels) > 24:
             raise unavailable("dashboard_definition_invalid")
         presets = _presets(conn, tenant, panels)
@@ -309,7 +311,7 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
                     raise
                 if current["revision"] != dashboard["revision"]:
                     raise AppError("dashboard_changed", "Dashboard changed; retry the count.", 409)
-                current_panels = current["panels"]
+                current_panels = [panel for panel in current["panels"] if panel["type"] == "count"]
             try:
                 current_revisions = _revision_map(_presets(conn, tenant, current_panels))
             except AppError as exc:

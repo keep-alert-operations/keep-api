@@ -192,3 +192,24 @@ def test_preview_schema_rejects_raw_dsl_conflicting_and_duplicate_sorts():
         DashboardPreview.model_validate(
             {"name": "Preview", "panels": [], "preset_revisions": {"bad": "1"}}
         )
+
+
+def test_dashboard_preview_takes_revisions_for_count_panels_only():
+    """Requirements: REV-57; dashboard operations 2 and 14."""
+    preset = "00000000-0000-4000-8000-000000000002"
+    layout = {"title": None, "y": 0, "w": 3, "h": 2}
+    panels = [
+        {**layout, "id": "00000000-0000-4000-8000-000000000011", "x": 0, "preset_id": preset},
+        {**layout, "id": "00000000-0000-4000-8000-000000000012", "x": 3, "type": "html", "html": "<p>Hi</p>"},
+    ]
+    parsed = DashboardPreview.model_validate(
+        {"name": "Preview", "panels": panels, "preset_revisions": {preset: "1"}}
+    )
+    assert [panel.type for panel in parsed.panels] == ["count", "html"]
+    DashboardPreview.model_validate(
+        {"name": "Preview", "panels": panels[1:], "preset_revisions": {}}
+    )
+    with pytest.raises(ValueError):
+        DashboardPreview.model_validate(
+            {"name": "Preview", "panels": panels[1:], "preset_revisions": {preset: "1"}}
+        )

@@ -12,6 +12,8 @@ from appchi.configuration.models import (
     PresetDefinition,
     PresetReplace,
     name_key,
+    presets_of,
+    sanitize_panels,
 )
 from appchi.shared.display_names import ActorPage, ActorRead, documented, enrich_actors
 from appchi.shared.errors import AppError, unavailable
@@ -31,17 +33,40 @@ def get_definition(conn, tenant, table, resource_id, lock=False):
     if not row:
         raise AppError("not_found", "Resource unavailable.", 404)
     if table == "dashboards":
-        row["panels"] = conn.execute(
-            "SELECT id,preset_id,title,x,y,w,h,thresholds FROM dashboard_panels WHERE tenant_id=%s AND dashboard_id=%s ORDER BY y,x,id",
-            (tenant, resource_id),
-        ).fetchall()
+        row["panels"] = [
+            panel_row(panel)
+            for panel in conn.execute(
+                "SELECT id,type,preset_id,title,x,y,w,h,thresholds,content FROM dashboard_panels WHERE tenant_id=%s AND dashboard_id=%s ORDER BY y,x,id",
+                (tenant, resource_id),
+            ).fetchall()
+        ]
     return row
 
 
+def panel_row(row):
+    """A stored panel in its wire shape: each type carries only its own settings."""
+    panel = {key: row[key] for key in ("id", "type", "title", "x", "y", "w", "h")}
+    if row["type"] == "html":
+        panel["html"] = row["content"]["html"]
+    else:
+        panel.update(preset_id=row["preset_id"], thresholds=row["thresholds"])
+    return panel
+
+
+def sanitized(panels):
+    """Sanitize HTML panels once the caller is authorized; return what was removed."""
+    try:
+        return sanitize_panels(panels)
+    except ValueError as exc:
+        raise AppError("invalid_html", str(exc), 422) from None
+
+
 def save(request, tenant, table, body, resource_id=None):
-    definition = body.model_dump(exclude={"command_id", "expected_revision"})
     with request.app.state.db.transaction() as conn:
         authorize(conn, request, tenant, "edit", mutation=True)
+    if table == "dashboards":
+        sanitized(body.panels)
+    definition = body.model_dump(exclude={"command_id", "expected_revision"})
     if table == "presets":
         from appchi.cel import compile_expression, CELValidationError, CELUnavailableError
 
@@ -61,6 +86,11 @@ def save(request, tenant, table, body, resource_id=None):
         if table == "presets" and payload.get("noisy") is False:
             # Likewise for commands sent before REV-58 had the alarm flag.
             payload.pop("noisy", None)
+        if table == "dashboards":
+            # Commands sent before REV-57 had no panel type; their retries still match.
+            for panel in payload["panels"]:
+                if panel["type"] == "count":
+                    del panel["type"]
         prior, fp = command_result(conn, scope, body.command_id, payload)
         if prior is not None:
             return prior
@@ -69,16 +99,18 @@ def save(request, tenant, table, body, resource_id=None):
             (tenant,),
         )
         if table == "dashboards":
-            for preset_id in sorted({p.preset_id for p in body.panels}):
+            for preset_id in sorted(presets_of(body.panels)):
                 get_definition(conn, tenant, "presets", preset_id, True)
             for panel in body.panels:
                 existing = conn.execute(
-                    "SELECT dashboard_id FROM dashboard_panels WHERE id=%s", (panel.id,)
+                    "SELECT dashboard_id,type FROM dashboard_panels WHERE id=%s", (panel.id,)
                 ).fetchone()
                 if existing and str(existing["dashboard_id"]) != resource_id:
                     raise AppError(
                         "panel_identity_conflict", "Panel belongs to another dashboard.", 409
                     )
+                if existing and existing["type"] != panel.type:
+                    raise AppError("panel_type_changed", "A panel keeps its type.", 422)
         previous = get_definition(conn, tenant, table, resource_id, True) if resource_id else None
         if previous:
             revision(previous, body.expected_revision)
@@ -136,19 +168,22 @@ def save(request, tenant, table, body, resource_id=None):
                 (tenant, resource_id),
             )
             for panel in body.panels:
+                count = panel.type == "count"
                 conn.execute(
-                    "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,preset_id,title,x,y,w,h,thresholds) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,type,preset_id,title,x,y,w,h,thresholds,content) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         panel.id,
                         tenant,
                         resource_id,
-                        panel.preset_id,
+                        panel.type,
+                        panel.preset_id if count else None,
                         panel.title,
                         panel.x,
                         panel.y,
                         panel.w,
                         panel.h,
-                        Jsonb([t.model_dump() for t in panel.thresholds]),
+                        Jsonb([t.model_dump() for t in panel.thresholds] if count else []),
+                        Jsonb({} if count else {"html": panel.html}),
                     ),
                 )
         result = get_definition(conn, tenant, table, resource_id)
@@ -247,9 +282,9 @@ def validate_preset(tenant_id: str, body: PresetDefinition, request: Request):
 def validate_dashboard(tenant_id: str, body: DashboardDefinition, request: Request):
     with request.app.state.db.transaction() as conn:
         authorize(conn, request, tenant_id, mutation=True)
-        for panel in body.panels:
-            get_definition(conn, tenant_id, "presets", panel.preset_id)
-    return {"data": {"valid": True}, "meta": {}}
+        for preset_id in presets_of(body.panels):
+            get_definition(conn, tenant_id, "presets", preset_id)
+    return {"data": {"valid": True, "removed": sanitized(body.panels)}, "meta": {}}
 
 
 def read_routes(table):
