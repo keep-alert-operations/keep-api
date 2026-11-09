@@ -126,6 +126,9 @@ def create_app(settings=None, db=None):
     from appchi.configuration.deletion import router as configuration_deletion
 
     app.include_router(configuration_deletion)
+    from appchi.configuration.image_routes import router as configuration_images
+
+    app.include_router(configuration_images)
     from appchi.configuration.read_routes import router as configuration_reads
 
     app.include_router(configuration_reads)

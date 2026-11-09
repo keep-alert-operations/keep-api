@@ -12,9 +12,11 @@ from appchi.configuration.models import (
     PresetDefinition,
     PresetReplace,
     name_key,
+    images_of,
     referenced_presets_of,
     sanitize_panels,
 )
+from appchi.configuration.image_routes import check_images, lock_images, mark_used
 from appchi.shared.display_names import ActorPage, ActorRead, documented, enrich_actors
 from appchi.shared.errors import AppError, unavailable
 from appchi.shared.transactions import command_result, revision, save_result
@@ -36,7 +38,7 @@ def get_definition(conn, tenant, table, resource_id, lock=False):
         row["panels"] = [
             panel_row(panel)
             for panel in conn.execute(
-                "SELECT id,type,preset_id,title,x,y,w,h,thresholds,content FROM dashboard_panels WHERE tenant_id=%s AND dashboard_id=%s ORDER BY y,x,id",
+                "SELECT id,type,preset_id,image_id,title,x,y,w,h,thresholds,content FROM dashboard_panels WHERE tenant_id=%s AND dashboard_id=%s ORDER BY y,x,id",
                 (tenant, resource_id),
             ).fetchall()
         ]
@@ -48,11 +50,35 @@ def panel_row(row):
     panel = {key: row[key] for key in ("id", "type", "title", "x", "y", "w", "h")}
     if row["type"] == "html":
         panel["html"] = row["content"]["html"]
+    elif row["type"] == "image":
+        content = row["content"]
+        panel.update(
+            image_id=str(row["image_id"]) if row["image_id"] else None,
+            url=content.get("url"),
+            fit=content.get("fit", "contain"),
+            alt=content.get("alt"),
+        )
     elif row["type"] == "table":
         panel.update(preset_id=row["preset_id"], rows=row["content"]["rows"])
     else:
         panel.update(preset_id=row["preset_id"], thresholds=row["thresholds"])
     return panel
+
+
+def panel_content(panel):
+    """Type-specific settings stored in content; count panels keep columns instead."""
+    if panel.type == "html":
+        return {"html": panel.html}
+    if panel.type == "image":
+        content = {"fit": panel.fit}
+        if panel.url is not None:
+            content["url"] = panel.url
+        if panel.alt is not None:
+            content["alt"] = panel.alt
+        return content
+    if panel.type == "table":
+        return {"rows": panel.rows}
+    return {}
 
 
 def sanitized(panels):
@@ -103,6 +129,8 @@ def save(request, tenant, table, body, resource_id=None):
         if table == "dashboards":
             for preset_id in sorted(referenced_presets_of(body.panels)):
                 get_definition(conn, tenant, "presets", preset_id, True)
+            # Images lock after presets and before dashboard rows (REV-62).
+            lock_images(conn, tenant, images_of(body.panels))
             for panel in body.panels:
                 existing = conn.execute(
                     "SELECT dashboard_id,type FROM dashboard_panels WHERE id=%s", (panel.id,)
@@ -169,29 +197,26 @@ def save(request, tenant, table, body, resource_id=None):
                 "DELETE FROM dashboard_panels WHERE tenant_id=%s AND dashboard_id=%s",
                 (tenant, resource_id),
             )
+            mark_used(conn, tenant, images_of(body.panels), now)
             for panel in body.panels:
                 count = panel.type == "count"
-                if count:
-                    content = {}
-                elif panel.type == "table":
-                    content = {"rows": panel.rows}
-                else:
-                    content = {"html": panel.html}
+                image = panel.type == "image"
                 conn.execute(
-                    "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,type,preset_id,title,x,y,w,h,thresholds,content) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,type,preset_id,image_id,title,x,y,w,h,thresholds,content) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         panel.id,
                         tenant,
                         resource_id,
                         panel.type,
                         panel.preset_id if panel.type in ("count", "table") else None,
+                        panel.image_id if image else None,
                         panel.title,
                         panel.x,
                         panel.y,
                         panel.w,
                         panel.h,
                         Jsonb([t.model_dump() for t in panel.thresholds] if count else []),
-                        Jsonb(content),
+                        Jsonb(panel_content(panel)),
                     ),
                 )
         result = get_definition(conn, tenant, table, resource_id)
@@ -295,6 +320,7 @@ def validate_dashboard(tenant_id: str, body: DashboardDefinition, request: Reque
         authorize(conn, request, tenant_id, mutation=True)
         for preset_id in referenced_presets_of(body.panels):
             get_definition(conn, tenant_id, "presets", preset_id)
+        check_images(conn, tenant_id, images_of(body.panels))
     return {"data": {"valid": True, "removed": sanitized(body.panels)}, "meta": {}}
 
 
