@@ -12,7 +12,7 @@ from appchi.configuration.models import (
     PresetDefinition,
     PresetReplace,
     name_key,
-    presets_of,
+    referenced_presets_of,
     sanitize_panels,
 )
 from appchi.shared.display_names import ActorPage, ActorRead, documented, enrich_actors
@@ -48,6 +48,8 @@ def panel_row(row):
     panel = {key: row[key] for key in ("id", "type", "title", "x", "y", "w", "h")}
     if row["type"] == "html":
         panel["html"] = row["content"]["html"]
+    elif row["type"] == "table":
+        panel.update(preset_id=row["preset_id"], rows=row["content"]["rows"])
     else:
         panel.update(preset_id=row["preset_id"], thresholds=row["thresholds"])
     return panel
@@ -99,7 +101,7 @@ def save(request, tenant, table, body, resource_id=None):
             (tenant,),
         )
         if table == "dashboards":
-            for preset_id in sorted(presets_of(body.panels)):
+            for preset_id in sorted(referenced_presets_of(body.panels)):
                 get_definition(conn, tenant, "presets", preset_id, True)
             for panel in body.panels:
                 existing = conn.execute(
@@ -169,6 +171,12 @@ def save(request, tenant, table, body, resource_id=None):
             )
             for panel in body.panels:
                 count = panel.type == "count"
+                if count:
+                    content = {}
+                elif panel.type == "table":
+                    content = {"rows": panel.rows}
+                else:
+                    content = {"html": panel.html}
                 conn.execute(
                     "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,type,preset_id,title,x,y,w,h,thresholds,content) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
@@ -176,14 +184,14 @@ def save(request, tenant, table, body, resource_id=None):
                         tenant,
                         resource_id,
                         panel.type,
-                        panel.preset_id if count else None,
+                        panel.preset_id if panel.type in ("count", "table") else None,
                         panel.title,
                         panel.x,
                         panel.y,
                         panel.w,
                         panel.h,
                         Jsonb([t.model_dump() for t in panel.thresholds] if count else []),
-                        Jsonb({} if count else {"html": panel.html}),
+                        Jsonb(content),
                     ),
                 )
         result = get_definition(conn, tenant, table, resource_id)
@@ -236,6 +244,9 @@ def public(row):
         for panel in result["panels"]:
             for key in ("x", "y", "w", "h"):
                 panel[key] = int(panel[key])
+            if "rows" in panel:
+                # A table panel's row count is a small integer, like its layout (REV-63).
+                panel["rows"] = int(panel["rows"])
     return result
 
 
@@ -282,7 +293,7 @@ def validate_preset(tenant_id: str, body: PresetDefinition, request: Request):
 def validate_dashboard(tenant_id: str, body: DashboardDefinition, request: Request):
     with request.app.state.db.transaction() as conn:
         authorize(conn, request, tenant_id, mutation=True)
-        for preset_id in presets_of(body.panels):
+        for preset_id in referenced_presets_of(body.panels):
             get_definition(conn, tenant_id, "presets", preset_id)
     return {"data": {"valid": True, "removed": sanitized(body.panels)}, "meta": {}}
 

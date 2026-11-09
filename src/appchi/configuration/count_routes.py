@@ -173,11 +173,18 @@ class PresetPreview(_PresetSelection):
     replace_cursor: str | None = Field(default=None, min_length=1, max_length=65536)
     group_key: str | None = Field(default=None, max_length=1024)
     group_empty: bool = False
+    # A saved preset's latest alerts, as an alert table panel lists them (REV-63):
+    # last received descending instead of the saved sort, and never grouped.
+    newest_first: bool = False
 
     @model_validator(mode="after")
     def continuation(self):
         if self.cursor and self.replace_cursor:
             raise ValueError("Continue a cursor or replace it, not both")
+        if self.newest_first and (
+            self.preset_id is None or self.group_key is not None or self.group_empty
+        ):
+            raise ValueError("Newest first needs a saved preset and no group")
         return self
 
 
@@ -400,6 +407,9 @@ def _preview_reader(request, tenant_id, body: _PresetSelection):
             if saved["profile"] != PROFILE:
                 raise unavailable("preset_profile_unavailable")
             definition = {key: saved[key] for key in ("cel", "sort", "columns", "group_by")}
+            if getattr(body, "newest_first", False):
+                definition["sort"] = [{"field": "timestamp", "direction": "desc"}]
+                definition["group_by"] = None
         else:
             definition = {
                 "cel": body.cel,

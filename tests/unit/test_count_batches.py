@@ -213,3 +213,49 @@ def test_dashboard_preview_takes_revisions_for_count_panels_only():
         DashboardPreview.model_validate(
             {"name": "Preview", "panels": panels[1:], "preset_revisions": {preset: "1"}}
         )
+
+
+def test_table_panels_are_not_counted_in_dashboard_previews():
+    """Requirements: REV-63; dashboard operations 10 and 14."""
+    preset, other = "00000000-0000-4000-8000-000000000002", "00000000-0000-4000-8000-000000000003"
+    layout = {"title": None, "y": 0, "w": 3, "h": 2}
+    panels = [
+        {**layout, "id": "00000000-0000-4000-8000-000000000011", "x": 0, "preset_id": preset},
+        {**layout, "id": "00000000-0000-4000-8000-000000000012", "x": 3, "type": "table", "preset_id": other, "rows": 5},
+    ]
+    parsed = DashboardPreview.model_validate(
+        {"name": "Preview", "panels": panels, "preset_revisions": {preset: "1"}}
+    )
+    assert [panel.type for panel in parsed.panels] == ["count", "table"]
+    with pytest.raises(ValueError):
+        DashboardPreview.model_validate(
+            {"name": "Preview", "panels": panels, "preset_revisions": {preset: "1", other: "1"}}
+        )
+
+
+def test_newest_first_previews_need_a_saved_preset_and_no_group():
+    """Requirements: REV-63; dashboard operations 14."""
+    saved = {"preset_id": "00000000-0000-4000-8000-000000000002", "expected_revision": "3"}
+    assert PresetPreview.model_validate({**saved, "newest_first": True, "limit": 10}).newest_first
+    assert not PresetPreview.model_validate(saved).newest_first
+    candidate = {"cel": "true", "sort": [{"field": "severity", "direction": "asc"}], "columns": ["message"]}
+    for body in (
+        {**candidate, "newest_first": True},
+        {**saved, "newest_first": True, "group_key": "critical"},
+        {**saved, "newest_first": True, "group_empty": True},
+    ):
+        with pytest.raises(ValueError):
+            PresetPreview.model_validate(body)
+
+
+def test_stored_table_panels_read_back_with_their_rows():
+    """Requirements: REV-63; dashboard operations 2 and 14."""
+    from appchi.configuration.routes import panel_row
+
+    layout = {"id": "p", "title": None, "x": 0, "y": 0, "w": 6, "h": 4}
+    assert panel_row(
+        {**layout, "type": "table", "preset_id": "s", "thresholds": [], "content": {"rows": 25}}
+    ) == {**layout, "type": "table", "preset_id": "s", "rows": 25}
+    assert panel_row(
+        {**layout, "type": "count", "preset_id": "s", "thresholds": [], "content": {}}
+    ) == {**layout, "type": "count", "preset_id": "s", "thresholds": []}
