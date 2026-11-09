@@ -33,3 +33,14 @@ private HTTPS proof process with `python -m appchi.operators.proof`. See the
 [configuration example](docs/operator-proof.example.json) for authentication,
 TLS, read-only SQL fences, limits and required target-cluster qualification.
 This is an operation-bound helper for the API's synchronous executor.
+
+ServiceNow ticket panels (REV-65) read counts from the ticket counting service named
+by the optional secret `APPCHI_TICKET_COUNT_URL`, mounted only into this API. It must
+be `https://` with a host (plain `http://` only for a loopback host in local
+development) and may carry an access key in its query string; it is never logged or
+returned. Without a usable address the panels show that ServiceNow isn't connected.
+Each process caches answers for 30 s (failures for 10 s), sends one request per
+team, state and detection at a time and runs at most 20 calls at once; see
+`appchi.configuration.ticket_counts`. The optional `APPCHI_TICKET_COUNT_CA_FILE`
+names a CA bundle that alone verifies the service's certificate. Startup sets the
+`httpx` and `httpcore` loggers to WARNING so request addresses are never logged.

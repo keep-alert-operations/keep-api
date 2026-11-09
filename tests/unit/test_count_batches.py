@@ -285,3 +285,40 @@ def test_panel_links_are_stored_in_content_and_read_back():
     row = {**layout, "type": "html", "preset_id": None, "thresholds": [],
            "content": panel_content(panels[1])}
     assert panel_row(row)["link"] == link
+
+
+def test_servicenow_panels_are_not_counted_and_store_settings_in_content():
+    """Requirements: REV-65; dashboard operations 2, 3 and 10."""
+    from appchi.configuration.routes import panel_content, panel_row
+
+    preset = "00000000-0000-4000-8000-000000000002"
+    layout = {"title": None, "y": 0, "w": 3, "h": 2}
+    tickets = {
+        **layout,
+        "id": "00000000-0000-4000-8000-000000000012",
+        "x": 3,
+        "type": "servicenow",
+        "team": "Network Ops",
+        "ticket_state": "in_progress",
+        "detection": "direct",
+        "thresholds": [{"lower_bound": "5", "color": "red"}],
+    }
+    panels = [{**layout, "id": "00000000-0000-4000-8000-000000000011", "x": 0, "preset_id": preset}, tickets]
+    parsed = DashboardPreview.model_validate(
+        {"name": "Preview", "panels": panels, "preset_revisions": {preset: "1"}}
+    )
+    assert [panel.type for panel in parsed.panels] == ["count", "servicenow"]
+    assert panel_content(parsed.panels[1]) == {
+        "team": "Network Ops",
+        "ticket_state": "in_progress",
+        "detection": "direct",
+    }
+    stored = {
+        **{key: tickets[key] for key in ("id", "type", "title", "x", "y", "w", "h")},
+        "preset_id": None,
+        "image_id": None,
+        "thresholds": tickets["thresholds"],
+        "content": panel_content(parsed.panels[1]),
+    }
+    assert panel_row(stored) == {**tickets, "link": None}
+    assert panel_row(stored) == parsed.panels[1].model_dump()
