@@ -77,6 +77,10 @@ def create_app(settings=None, db=None):
 
             app.state.recovery_store = configured_store(app.state.settings)
         owned_recovery_store = app.state.recovery_store
+        from appchi.configuration.ticket_counts import TicketCounts
+
+        # REV-65: an invalid address is logged here and leaves ticket panels unconnected.
+        app.state.ticket_counts = TicketCounts.from_settings(app.state.settings)
         app.state.live_registry = LiveRegistry()
         listener = (
             asyncio.create_task(redis_listener(app.state.settings, app.state.live_registry))
@@ -100,6 +104,7 @@ def create_app(settings=None, db=None):
                 listener.cancel()
                 with suppress(asyncio.CancelledError):
                     await listener
+            await app.state.ticket_counts.close()
             if owned_recovery_store:
                 owned_recovery_store.close()
             if owned_search_client:
@@ -135,6 +140,13 @@ def create_app(settings=None, db=None):
     from appchi.configuration.count_routes import router as configuration_counts
 
     app.include_router(configuration_counts)
+    from appchi.configuration.ticket_count_routes import (
+        admin_router as ticket_count_administration,
+        router as ticket_counts,
+    )
+
+    app.include_router(ticket_counts)
+    app.include_router(ticket_count_administration)
     from appchi.maintenance.routes import router as maintenance
 
     app.include_router(maintenance)

@@ -60,13 +60,21 @@ def panel_row(row):
         )
     elif row["type"] == "table":
         panel.update(preset_id=row["preset_id"], rows=row["content"]["rows"])
+    elif row["type"] == "servicenow":
+        content = row["content"]
+        panel.update(
+            team=content["team"],
+            ticket_state=content["ticket_state"],
+            detection=content["detection"],
+            thresholds=row["thresholds"],
+        )
     else:
         panel.update(preset_id=row["preset_id"], thresholds=row["thresholds"])
     return panel
 
 
 def panel_content(panel):
-    """Type-specific settings stored in content; count panels keep columns instead."""
+    """Type-specific settings stored in content; preset IDs and thresholds keep their columns."""
     if panel.type == "html":
         return {"html": panel.html}
     if panel.type == "image":
@@ -78,6 +86,8 @@ def panel_content(panel):
         return content
     if panel.type == "table":
         return {"rows": panel.rows}
+    if panel.type == "servicenow":
+        return {"team": panel.team, "ticket_state": panel.ticket_state, "detection": panel.detection}
     return {}
 
 
@@ -199,7 +209,7 @@ def save(request, tenant, table, body, resource_id=None):
             )
             mark_used(conn, tenant, images_of(body.panels), now)
             for panel in body.panels:
-                count = panel.type == "count"
+                counted = panel.type in ("count", "servicenow")
                 image = panel.type == "image"
                 conn.execute(
                     "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,type,preset_id,image_id,title,x,y,w,h,thresholds,content) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -215,7 +225,7 @@ def save(request, tenant, table, body, resource_id=None):
                         panel.y,
                         panel.w,
                         panel.h,
-                        Jsonb([t.model_dump() for t in panel.thresholds] if count else []),
+                        Jsonb([t.model_dump() for t in panel.thresholds] if counted else []),
                         Jsonb(panel_content(panel)),
                     ),
                 )
