@@ -13,7 +13,7 @@ from appchi.configuration.models import (
     PresetReplace,
     name_key,
     images_of,
-    presets_of,
+    referenced_presets_of,
     sanitize_panels,
 )
 from appchi.configuration.image_routes import check_images, lock_images, mark_used
@@ -58,6 +58,8 @@ def panel_row(row):
             fit=content.get("fit", "contain"),
             alt=content.get("alt"),
         )
+    elif row["type"] == "table":
+        panel.update(preset_id=row["preset_id"], rows=row["content"]["rows"])
     else:
         panel.update(preset_id=row["preset_id"], thresholds=row["thresholds"])
     return panel
@@ -74,6 +76,8 @@ def panel_content(panel):
         if panel.alt is not None:
             content["alt"] = panel.alt
         return content
+    if panel.type == "table":
+        return {"rows": panel.rows}
     return {}
 
 
@@ -123,7 +127,7 @@ def save(request, tenant, table, body, resource_id=None):
             (tenant,),
         )
         if table == "dashboards":
-            for preset_id in sorted(presets_of(body.panels)):
+            for preset_id in sorted(referenced_presets_of(body.panels)):
                 get_definition(conn, tenant, "presets", preset_id, True)
             # Images lock after presets and before dashboard rows (REV-62).
             lock_images(conn, tenant, images_of(body.panels))
@@ -204,7 +208,7 @@ def save(request, tenant, table, body, resource_id=None):
                         tenant,
                         resource_id,
                         panel.type,
-                        panel.preset_id if count else None,
+                        panel.preset_id if panel.type in ("count", "table") else None,
                         panel.image_id if image else None,
                         panel.title,
                         panel.x,
@@ -265,6 +269,9 @@ def public(row):
         for panel in result["panels"]:
             for key in ("x", "y", "w", "h"):
                 panel[key] = int(panel[key])
+            if "rows" in panel:
+                # A table panel's row count is a small integer, like its layout (REV-63).
+                panel["rows"] = int(panel["rows"])
     return result
 
 
@@ -311,7 +318,7 @@ def validate_preset(tenant_id: str, body: PresetDefinition, request: Request):
 def validate_dashboard(tenant_id: str, body: DashboardDefinition, request: Request):
     with request.app.state.db.transaction() as conn:
         authorize(conn, request, tenant_id, mutation=True)
-        for preset_id in presets_of(body.panels):
+        for preset_id in referenced_presets_of(body.panels):
             get_definition(conn, tenant_id, "presets", preset_id)
         check_images(conn, tenant_id, images_of(body.panels))
     return {"data": {"valid": True, "removed": sanitized(body.panels)}, "meta": {}}
