@@ -255,7 +255,33 @@ def test_stored_table_panels_read_back_with_their_rows():
     layout = {"id": "p", "title": None, "x": 0, "y": 0, "w": 6, "h": 4}
     assert panel_row(
         {**layout, "type": "table", "preset_id": "s", "thresholds": [], "content": {"rows": 25}}
-    ) == {**layout, "type": "table", "preset_id": "s", "rows": 25}
+    ) == {**layout, "link": None, "type": "table", "preset_id": "s", "rows": 25}
     assert panel_row(
         {**layout, "type": "count", "preset_id": "s", "thresholds": [], "content": {}}
-    ) == {**layout, "type": "count", "preset_id": "s", "thresholds": []}
+    ) == {**layout, "link": None, "type": "count", "preset_id": "s", "thresholds": []}
+
+
+def test_panel_links_are_stored_in_content_and_read_back():
+    """Requirements: REV-66; dashboard operations 2 and 14."""
+    from appchi.configuration.models import DashboardDefinition
+    from appchi.configuration.routes import panel_content, panel_row
+
+    link = {"url": "https://runbooks.example/a", "label": "Runbook"}
+    layout = {"id": "00000000-0000-4000-8000-000000000010", "title": None,
+              "x": 0, "y": 0, "w": 3, "h": 2}
+    panels = DashboardDefinition(
+        name="Board",
+        panels=[
+            {**layout, "preset_id": "00000000-0000-4000-8000-000000000002", "link": link},
+            {**layout, "id": "00000000-0000-4000-8000-000000000011", "x": 3, "type": "html",
+             "html": "<p>Hi</p>", "link": link},
+            {**layout, "id": "00000000-0000-4000-8000-000000000012", "x": 6, "type": "html",
+             "html": "<p>Hi</p>"},
+        ],
+    ).panels
+    assert panel_content(panels[0]) == {"link": link}
+    assert panel_content(panels[1]) == {"link": link, "html": "<p>Hi</p>"}
+    assert panel_content(panels[2]) == {"html": "<p>Hi</p>"}
+    row = {**layout, "type": "html", "preset_id": None, "thresholds": [],
+           "content": panel_content(panels[1])}
+    assert panel_row(row)["link"] == link
