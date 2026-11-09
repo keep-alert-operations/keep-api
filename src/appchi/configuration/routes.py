@@ -48,6 +48,8 @@ def get_definition(conn, tenant, table, resource_id, lock=False):
 def panel_row(row):
     """A stored panel in its wire shape: each type carries only its own settings."""
     panel = {key: row[key] for key in ("id", "type", "title", "x", "y", "w", "h")}
+    # Every panel type may have a link button; older panels have none (REV-66).
+    panel["link"] = row["content"].get("link")
     if row["type"] == "html":
         panel["html"] = row["content"]["html"]
     elif row["type"] == "image":
@@ -74,21 +76,24 @@ def panel_row(row):
 
 
 def panel_content(panel):
-    """Type-specific settings stored in content; preset IDs and thresholds keep their columns."""
+    """Settings stored in content: the panel link (REV-66) and type-specific settings;
+    preset IDs and thresholds keep their columns."""
+    content = {"link": panel.link.model_dump()} if panel.link else {}
     if panel.type == "html":
-        return {"html": panel.html}
-    if panel.type == "image":
-        content = {"fit": panel.fit}
+        content["html"] = panel.html
+    elif panel.type == "image":
+        content["fit"] = panel.fit
         if panel.url is not None:
             content["url"] = panel.url
         if panel.alt is not None:
             content["alt"] = panel.alt
-        return content
-    if panel.type == "table":
-        return {"rows": panel.rows}
-    if panel.type == "servicenow":
-        return {"team": panel.team, "ticket_state": panel.ticket_state, "detection": panel.detection}
-    return {}
+    elif panel.type == "table":
+        content["rows"] = panel.rows
+    elif panel.type == "servicenow":
+        content.update(
+            team=panel.team, ticket_state=panel.ticket_state, detection=panel.detection
+        )
+    return content
 
 
 def sanitized(panels):
@@ -129,6 +134,9 @@ def save(request, tenant, table, body, resource_id=None):
             for panel in payload["panels"]:
                 if panel["type"] == "count":
                     del panel["type"]
+                # Likewise for commands sent before REV-66 had panel links.
+                if panel["link"] is None:
+                    del panel["link"]
         prior, fp = command_result(conn, scope, body.command_id, payload)
         if prior is not None:
             return prior
