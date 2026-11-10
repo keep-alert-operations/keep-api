@@ -8,6 +8,7 @@ from keep.configuration.models import (
     DashboardCreate,
     DashboardDefinition,
     DashboardReplace,
+    PRESET_TYPES,
     PresetCreate,
     PresetDefinition,
     PresetReplace,
@@ -63,6 +64,12 @@ def panel_row(row):
         )
     elif row["type"] == "table":
         panel.update(preset_id=row["preset_id"], rows=row["content"]["rows"])
+    elif row["type"] == "incident_count":
+        panel.update(
+            preset_id=row["preset_id"],
+            incident_status=row["content"]["incident_status"],
+            thresholds=row["thresholds"],
+        )
     elif row["type"] == "servicenow":
         content = row["content"]
         panel.update(
@@ -99,6 +106,8 @@ def panel_content(panel):
         )
     elif panel.type == "grafana":
         content["url"] = panel.url
+    elif panel.type == "incident_count":
+        content["incident_status"] = panel.incident_status
     return content
 
 
@@ -240,7 +249,7 @@ def save(request, tenant, table, body, resource_id=None):
             )
             mark_used(conn, tenant, images_of(body.panels), now)
             for panel in body.panels:
-                counted = panel.type in ("count", "servicenow")
+                counted = panel.type in ("count", "servicenow", "incident_count")
                 image = panel.type == "image"
                 conn.execute(
                     "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,type,preset_id,image_id,title,x,y,w,h,thresholds,content) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -249,7 +258,7 @@ def save(request, tenant, table, body, resource_id=None):
                         tenant,
                         resource_id,
                         panel.type,
-                        panel.preset_id if panel.type in ("count", "table") else None,
+                        panel.preset_id if panel.type in PRESET_TYPES else None,
                         panel.image_id if image else None,
                         panel.title,
                         panel.x,
