@@ -5,14 +5,14 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from appchi.alerts.lifecycle import apply_command, apply_source
-from appchi.alerts.presentation import display_status, present_alert, present_command_result
-from appchi.cel import CELValidationError, compile_expression
-from appchi.cel.routes import describe_profile
-from appchi.models import AlertCommand, BulkCommand
-from appchi.search.projection import index_mapping
-from appchi.search.reader import sort_spec
-from appchi.shared.errors import AppError
+from keep.alerts.lifecycle import apply_command, apply_source
+from keep.alerts.presentation import display_status, present_alert, present_command_result
+from keep.cel import CELValidationError, compile_expression
+from keep.cel.routes import describe_profile
+from keep.models import AlertCommand, BulkCommand
+from keep.search.projection import index_mapping
+from keep.search.reader import sort_spec
+from keep.shared.errors import AppError
 
 NOW = datetime(2026, 9, 27, tzinfo=UTC)
 

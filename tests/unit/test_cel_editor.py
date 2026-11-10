@@ -2,8 +2,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from appchi.cel import compiler
-from appchi.cel.routes import describe_profile, diagnostic
+from keep.cel import compiler
+from keep.cel.routes import describe_profile, diagnostic
 
 
 def test_advertised_operators_and_functions_compile_with_native_runtime():

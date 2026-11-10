@@ -15,11 +15,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 import pytest
 
-from appchi.operators.proof import (
+from keep.operators.proof import (
     ProofConfiguration, ProofDatabase, ProofFailure, ProofRequest, ProofService, create_app,
 )
-from appchi.operators.worker import policy_document
-from appchi.recovery.guard import RESTORE_LOCK
+from keep.operators.worker import policy_document
+from keep.recovery.guard import RESTORE_LOCK
 
 
 pytestmark = pytest.mark.integration
@@ -32,10 +32,10 @@ def member_configuration():
 
 @pytest.fixture(scope="module")
 def isolated():
-    admin_url = os.getenv("APPCHI_PROOF_TEST_POSTGRES_ADMIN_DSN")
+    admin_url = os.getenv("KEEP_PROOF_TEST_POSTGRES_ADMIN_DSN")
     if not admin_url:
-        pytest.skip("Bind APPCHI_PROOF_TEST_POSTGRES_ADMIN_DSN to isolated PostgreSQL")
-    from appchi.migrate import migrate
+        pytest.skip("Bind KEEP_PROOF_TEST_POSTGRES_ADMIN_DSN to isolated PostgreSQL")
+    from keep.migrate import migrate
 
     database, login = "proof_test_" + uuid4().hex, "proof_login_" + uuid4().hex
     password = secrets.token_urlsafe(32)
@@ -47,7 +47,7 @@ def isolated():
     try:
         migrate(owner_url)
         with psycopg.connect(owner_url, autocommit=True) as owner:
-            owner.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {} IN ROLE appchi_worker").format(
+            owner.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {} IN ROLE keep_worker").format(
                 sql.Identifier(login), sql.Literal(password)))
             owner.execute(sql.SQL("ALTER ROLE {} SET default_transaction_read_only=on").format(
                 sql.Identifier(login)))

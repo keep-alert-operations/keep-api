@@ -10,9 +10,9 @@ from uuid import uuid4
 import psycopg
 import pytest
 
-from appchi.db import Database
-from appchi import live
-from appchi.live import publish_hints
+from keep.db import Database
+from keep import live
+from keep.live import publish_hints
 
 pytestmark = pytest.mark.integration
 
@@ -28,7 +28,7 @@ class ApiDatabase:
     def transaction(self, tenant_id=None, *, read_committed=False):
         self.units.append((tenant_id, read_committed))
         with self.database.transaction(tenant_id, read_committed=read_committed) as conn:
-            conn.execute("SET LOCAL ROLE appchi_api")
+            conn.execute("SET LOCAL ROLE keep_api")
             yield conn
 
 
@@ -85,7 +85,7 @@ def test_batch_delete_removes_only_the_published_generations(real_db, monkeypatc
             if len(self.calls) == 2:
                 stop.set()
 
-    database = Database(os.environ["APPCHI_TEST_DATABASE_URL"], deployment_epoch="test")
+    database = Database(os.environ["KEEP_TEST_DATABASE_URL"], deployment_epoch="test")
     api = ApiDatabase(database)
     try:
         assert publish_hints(api, SimpleNamespace(environment="test"), Publisher(), stop=stop) == 2
@@ -118,11 +118,11 @@ def test_locked_published_row_defers_the_delete_within_the_lock_timeout(real_db)
         def publish(self, channel, data):
             self.calls.append(channel)
 
-    database = Database(os.environ["APPCHI_TEST_DATABASE_URL"], deployment_epoch="test")
+    database = Database(os.environ["KEEP_TEST_DATABASE_URL"], deployment_epoch="test")
     api = ApiDatabase(database)
     # A multi-tenant view-state writer holds one published row (as the 0020 trigger
     # upsert would) until after the API's DELETE has given up.
-    with psycopg.connect(os.environ["APPCHI_TEST_DATABASE_URL"]) as writer:
+    with psycopg.connect(os.environ["KEEP_TEST_DATABASE_URL"]) as writer:
         writer.execute(
             "SELECT 1 FROM live_hint_outbox WHERE tenant_id=%s FOR UPDATE", (tenants[1],)
         )
@@ -162,7 +162,7 @@ def test_delete_holds_taken_row_locks_no_longer_than_the_statement_timeout(real_
     free, chain = tenants[:2], tenants[2:]
     before = pending(real_db)
     assert set(before) == set(tenants)
-    dsn = os.environ["APPCHI_TEST_DATABASE_URL"]
+    dsn = os.environ["KEEP_TEST_DATABASE_URL"]
     lock = "SELECT 1 FROM live_hint_outbox WHERE tenant_id=%s FOR UPDATE"
 
     holders = [psycopg.connect(dsn) for _ in chain]

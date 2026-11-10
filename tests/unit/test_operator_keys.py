@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from appchi.operators.keys import (
+from keep.operators.keys import (
     Credential,
     ReadinessEvidence,
     activate,
@@ -15,8 +15,8 @@ from appchi.operators.keys import (
     generate_key,
     revoke,
 )
-from appchi.operators.saga import ProvisioningProgress, deletion_may_commit, next_step, retry_at
-from appchi.shared.errors import AppError
+from keep.operators.saga import ProvisioningProgress, deletion_may_commit, next_step, retry_at
+from keep.shared.errors import AppError
 
 NOW = datetime(2026, 9, 22, 12, tzinfo=timezone.utc)
 PROOF = ReadinessEvidence(7, True, True, True)

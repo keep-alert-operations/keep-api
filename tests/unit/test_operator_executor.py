@@ -12,12 +12,12 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from appchi.operators.binding import OperatorBinding, EXTRA_CAPABILITIES
-from appchi.operators.executor import PlatformCredentials, ProvisioningExecutor
-from appchi.operators.policy import resource_identity
-from appchi.operators.remote import REQUIRED_CAPABILITIES
-from appchi.operators.worker import Work
-from appchi.shared.errors import AppError
+from keep.operators.binding import OperatorBinding, EXTRA_CAPABILITIES
+from keep.operators.executor import PlatformCredentials, ProvisioningExecutor
+from keep.operators.policy import resource_identity
+from keep.operators.remote import REQUIRED_CAPABILITIES
+from keep.operators.worker import Work
+from keep.shared.errors import AppError
 
 
 class Ledger:
@@ -61,7 +61,7 @@ class Remote:
             {
                 "uid": "rule1",
                 "orgID": 1,
-                "labels": {"Appchi - Old Ω": "{{ $values.A }}", "team": "existing"},
+                "labels": {"Keep - Old Ω": "{{ $values.A }}", "team": "existing"},
                 "title": "Unchanged",
                 "data": [{"model": {"expr": "up"}}],
             }
@@ -115,7 +115,7 @@ class Remote:
             if path == "/":
                 return httpx.Response(200, json={"version": "fixture-kong"})
             parts = path.strip("/").split("/")
-            if parts[0] == "appchi-policies":
+            if parts[0] == "keep-policies":
                 if method == "PUT":
                     self.gateway_policy = body
                 return httpx.Response(200, json=self.gateway_policy)
@@ -171,8 +171,8 @@ class Remote:
 
 @pytest.fixture
 def executor(monkeypatch):
-    monkeypatch.setattr("appchi.operators.kafka_drain.require_drain", lambda *args, **kwargs: None)
-    monkeypatch.setattr("appchi.operators.repository.in_use", lambda *args: None)
+    monkeypatch.setattr("keep.operators.kafka_drain.require_drain", lambda *args, **kwargs: None)
+    monkeypatch.setattr("keep.operators.repository.in_use", lambda *args: None)
     work = Work(
         str(uuid4()),
         str(uuid4()),
@@ -187,7 +187,7 @@ def executor(monkeypatch):
         "vena_" + "a" * 43,
     )
     binding = OperatorBinding(
-        profile="grafana-provisioning-v1-kong-appchi-policy-v1",
+        profile="grafana-provisioning-v1-kong-keep-policy-v1",
         grafana_url="https://grafana.test",
         kong_url="https://kong.test",
         probe_url="https://probe.test/check",
@@ -232,7 +232,7 @@ def test_setup_requires_matching_probe_and_keeps_company_routes(executor):
     )
     assert remote.policy["routes"][-1] == remote.company
     route = remote.policy["routes"][0]
-    assert route["object_matchers"] == [["Appchi - Old Ω", "=", "true"]]
+    assert route["object_matchers"] == [["Keep - Old Ω", "=", "true"]]
     assert route["continue"] is True and route["group_by"] == ["..."]
     assert remote.receivers[0]["settings"]["authorization_credentials"] == work.secret
     assert ledger.edits == []
@@ -290,14 +290,14 @@ def test_rename_and_cancel_restore_only_journaled_labels(executor, restore_kind)
         work, kind="rename", pending_name="New Ω", current_id=work.candidate_id, candidate_id=None
     )
     adapter.execute(renamed)
-    assert remote.rules[0]["labels"] == {"Appchi - New Ω": "{{ $values.A }}", "team": "existing"}
+    assert remote.rules[0]["labels"] == {"Keep - New Ω": "{{ $values.A }}", "team": "existing"}
     assert len(ledger.edits) == 1
     remote.rules[0]["title"] = "Fresh unrelated edit"
     ledger.restore_edits = deepcopy(ledger.edits)
     adapter.execute(replace(renamed, kind=restore_kind, cancel_kind="rename"))
-    assert remote.rules[0]["labels"] == {"Appchi - Old Ω": "{{ $values.A }}", "team": "existing"}
+    assert remote.rules[0]["labels"] == {"Keep - Old Ω": "{{ $values.A }}", "team": "existing"}
     assert remote.rules[0]["title"] == "Fresh unrelated edit"
-    assert remote.policy["routes"][0]["object_matchers"][0][0] == "Appchi - Old Ω"
+    assert remote.policy["routes"][0]["object_matchers"][0][0] == "Keep - Old Ω"
 
 
 def test_delete_proves_grafana_absence_before_kong_cleanup(executor):
@@ -383,8 +383,8 @@ def test_delete_cancel_reverses_superseded_rename_then_delete(executor):
     adapter.execute(replace(renamed, kind="delete"))
     ledger.restore_edits = rename_edits + deepcopy(ledger.edits)
     adapter.execute(replace(renamed, kind="cancel", cancel_kind="delete"))
-    assert remote.rules[0]["labels"] == {"Appchi - Old Ω": "{{ $values.A }}", "team": "existing"}
-    assert remote.policy["routes"][0]["object_matchers"] == [["Appchi - Old Ω", "=", "true"]]
+    assert remote.rules[0]["labels"] == {"Keep - Old Ω": "{{ $values.A }}", "team": "existing"}
+    assert remote.policy["routes"][0]["object_matchers"] == [["Keep - Old Ω", "=", "true"]]
 
 
 def test_supported_version_mismatch_blocks_all_writes(executor):

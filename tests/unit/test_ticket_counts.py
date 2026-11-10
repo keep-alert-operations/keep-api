@@ -13,15 +13,15 @@ import httpx
 from pydantic import SecretStr, ValidationError
 import pytest
 
-from appchi.configuration import ticket_count_routes, ticket_counts
-from appchi.configuration.ticket_count_routes import TicketCountQuery, TicketCountRequest
-from appchi.configuration.ticket_counts import (
+from keep.configuration import ticket_count_routes, ticket_counts
+from keep.configuration.ticket_count_routes import TicketCountQuery, TicketCountRequest
+from keep.configuration.ticket_counts import (
     TicketCounts,
     interpret,
     parse_endpoint,
     query_url,
 )
-from appchi.shared.errors import AppError
+from keep.shared.errors import AppError
 
 KEY = "s3cret-key-value"
 URL = f"https://tickets.example.com:8443/api/count?key={KEY}&team=ignored&format=json"
@@ -154,7 +154,7 @@ def test_invalid_configuration_means_not_configured():
     ],
 )
 def test_panel_values_replace_same_named_parameters_and_keep_the_rest(state, detection, expected):
-    """Requirements: REV-65; dashboard operations 3 (Keep's query parameters)."""
+    """Requirements: REV-65; dashboard operations 3 (KeepHQ's query parameters)."""
     endpoint = parse_endpoint(URL + "&state=closed&system_failure=maybe")
     parts = urlsplit(query_url(endpoint, "Net Ops & Co", state, detection))
     assert (parts.scheme, parts.netloc, parts.path) == (
@@ -187,7 +187,7 @@ def test_counts_are_fetched_with_one_plain_get():
     (request,) = service.requests
     assert request.method == "GET"
     assert request.headers["accept"] == "application/json"
-    assert request.headers["user-agent"] == "appchi-api"
+    assert request.headers["user-agent"] == "keep-api"
     assert "authorization" not in request.headers and "cookie" not in request.headers
     assert dict(service.params()) == {
         "key": KEY,
@@ -428,7 +428,7 @@ def test_connection_check_bypasses_the_cache_and_accepts_any_json():
     assert dict(service.params()) == {
         "key": KEY,
         "format": "json",
-        "team": "__appchi_connection_check__",
+        "team": "__keep_connection_check__",
         "state": "all",
     }
     assert not counts.answers
@@ -475,7 +475,7 @@ class Database:
 def application(monkeypatch, service, *, role_ok=True, super_admin=False):
     """The real HTTP stack with authentication replaced by recorded checks."""
     from fastapi import FastAPI  # noqa: F401
-    from appchi.http import create_http_app
+    from keep.http import create_http_app
 
     calls = []
 

@@ -2,7 +2,7 @@
 
 from uuid import uuid4
 
-from appchi.shared.display_names import (
+from keep.shared.display_names import (
     actor_names,
     enrich_actors,
     enrich_alerts,
@@ -194,7 +194,7 @@ def test_actor_names_follow_the_ids_each_row_carries():
 
 
 def test_openapi_publishes_optional_display_fields_for_changed_reads():
-    from appchi.main import app
+    from keep.main import app
 
     spec = app.openapi()
     schemas = spec["components"]["schemas"]

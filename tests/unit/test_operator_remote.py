@@ -5,19 +5,19 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from appchi.operators.policy import (
+from keep.operators.policy import (
     ManagedRoute,
     migrate_rule_labels,
     normalized_name,
     routing_intent,
 )
-from appchi.operators.remote import (
+from keep.operators.remote import (
     CapabilityManifest,
     Endpoint,
     REQUIRED_CAPABILITIES,
     RemoteAdapter,
 )
-from appchi.shared.errors import AppError
+from keep.shared.errors import AppError
 
 
 def manifest(**changes):
@@ -56,15 +56,15 @@ def test_company_branch_and_default_preserved_and_routes_continue():
 
 def test_rule_label_migration_changes_only_exact_label_and_preserves_expression():
     rule = {
-        "labels": {"Appchi - Old": "{{ $values.A.Value }}", "team": "payments"},
+        "labels": {"Keep - Old": "{{ $values.A.Value }}", "team": "payments"},
         "query": {"x": [1, 2]},
     }
     migrated = migrate_rule_labels(rule, "Old", "NEW")
-    assert migrated["labels"] == {"Appchi - NEW": "{{ $values.A.Value }}", "team": "payments"}
+    assert migrated["labels"] == {"Keep - NEW": "{{ $values.A.Value }}", "team": "payments"}
     assert migrated["query"] == rule["query"]
-    assert "Appchi - Old" in rule["labels"]
+    assert "Keep - Old" in rule["labels"]
     assert migrate_rule_labels(rule, "Old", None)["labels"] == {"team": "payments"}
-    rule["labels"]["Appchi - NEW"] = "conflict"
+    rule["labels"]["Keep - NEW"] = "conflict"
     with pytest.raises(AppError):
         migrate_rule_labels(rule, "Old", "NEW")
 
@@ -82,7 +82,7 @@ def test_cas_header_fresh_read_and_verified_readback():
         calls.append(request)
         if request.method == "GET":
             return httpx.Response(
-                200, json={"owner": "appchi", "value": len(calls) > 1}, headers={"ETag": '"7"'}
+                200, json={"owner": "keep", "value": len(calls) > 1}, headers={"ETag": '"7"'}
             )
         assert request.headers["If-Match"] == '"7"'
         return httpx.Response(200, json={})
@@ -94,7 +94,7 @@ def test_cas_header_fresh_read_and_verified_readback():
         "tree",
         {},
         coordinator=nullcontext(),
-        ownership=lambda doc: doc["owner"] == "appchi",
+        ownership=lambda doc: doc["owner"] == "keep",
         merge=lambda doc: dict(doc, value=True),
         matches=lambda wanted, actual: wanted == actual,
     )
@@ -111,7 +111,7 @@ def test_no_safe_writer_or_missing_precondition_blocks_before_write():
 
     def transport(request):
         methods.append(request.method)
-        return httpx.Response(200, json={"owner": "appchi"})
+        return httpx.Response(200, json={"owner": "keep"})
 
     adapter = RemoteAdapter(
         httpx.Client(transport=httpx.MockTransport(transport)), "https://test.invalid", manifest()
