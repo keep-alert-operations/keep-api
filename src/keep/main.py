@@ -85,6 +85,14 @@ def create_app(settings=None, db=None):
 
         # REV-68: unusable Grafana entries are logged and ignored; start-up never fails here.
         app.state.grafana_origins = configured_origins(app.state.settings)
+
+        from keep.incidents.tickets import parse_servicenow
+
+        # REV-70: an unusable KEEP_SERVICENOW_URL is logged here and turns tickets off.
+        app.state.servicenow = parse_servicenow(
+            app.state.settings.servicenow_url,
+            development=app.state.settings.environment == "development",
+        )
         app.state.live_registry = LiveRegistry()
         listener = (
             asyncio.create_task(redis_listener(app.state.settings, app.state.live_registry))
@@ -158,6 +166,10 @@ def create_app(settings=None, db=None):
 
     app.include_router(grafana_panels)
     app.include_router(grafana_panel_administration)
+
+    from keep.incidents.servicenow import router as servicenow
+
+    app.include_router(servicenow)
     from keep.maintenance.routes import router as maintenance
 
     app.include_router(maintenance)

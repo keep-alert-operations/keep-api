@@ -252,6 +252,12 @@ def test_openapi_publishes_optional_display_fields_for_changed_reads():
         "total_linked",
         "suppressed",
         "unavailable",
+        # REV-70: the linked ServiceNow ticket and who linked it.
+        "ticket_url",
+        "ticket_number",
+        "ticket_linked_at",
+        "ticket_linked_by",
+        "ticket_linked_by_display_name",
     }
     assert set(schemas["ActorDisplayNames"]["properties"]) == {
         "created_by_display_name",
