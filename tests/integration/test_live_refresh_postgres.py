@@ -9,10 +9,10 @@ from uuid import uuid4
 
 import pytest
 
-from appchi.db import Database
-from appchi.identity.authentication import SESSION_COOKIE
-from appchi.live import LiveRegistry, refresh, state
-from appchi.shared.errors import AppError
+from keep.db import Database
+from keep.identity.authentication import SESSION_COOKIE
+from keep.live import LiveRegistry, refresh, state
+from keep.shared.errors import AppError
 
 pytestmark = pytest.mark.integration
 
@@ -28,7 +28,7 @@ class ApiDatabase:
     def transaction(self, tenant_id=None, *, read_committed=False):
         self.units.append((tenant_id, read_committed))
         with self.database.transaction(tenant_id, read_committed=read_committed) as conn:
-            conn.execute("SET LOCAL ROLE appchi_api")
+            conn.execute("SET LOCAL ROLE keep_api")
             yield conn
 
 
@@ -50,7 +50,7 @@ def stream(real_db, tenant):
             "INSERT INTO auth_sessions(handle_hash,principal_id,issuer,subject,provider_sid,csrf_hash,csrf_cipher,auth_time,activity_at,absolute_at,deployment_epoch) VALUES(%s,%s,'https://test.invalid',%s,%s,%s,%s,clock_timestamp(),clock_timestamp(),clock_timestamp()+interval '1 day','test')",
             (hashed, principal, str(principal), str(principal), hashlib.sha256(b"csrf").digest(), b"unused"),
         )
-    database = Database(os.environ["APPCHI_TEST_DATABASE_URL"], deployment_epoch="test")
+    database = Database(os.environ["KEEP_TEST_DATABASE_URL"], deployment_epoch="test")
     api = ApiDatabase(database)
     registry = LiveRegistry()
     registry.register(str(tenant))

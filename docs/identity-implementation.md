@@ -1,15 +1,15 @@
 # Identity implementation and private-environment checks
 
-**2026-09-30 directory scope (REV-35):** the directory worker is nice-to-have and is not started by current launchers. Explicit trusted publication remains required for bootstrap and identity changes; automatic five-minute LDAP propagation is deferred. See [current worker scope](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-worker-scope.md#4-directory-synchronization-is-nice-to-have). Historical runtime evidence below does not describe a rollout of this later change.
+**2026-09-30 directory scope (REV-35):** the directory worker is nice-to-have and is not started by current launchers. Explicit trusted publication remains required for bootstrap and identity changes; automatic five-minute LDAP propagation is deferred. See [current worker scope](https://github.com/keep-alert-operations/keep-design/blob/main/specs/spec-worker-scope.md#4-directory-synchronization-is-nice-to-have). Historical runtime evidence below does not describe a rollout of this later change.
 
-This implementation follows [the identity contract](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-identity-configuration.md)
-and [tenant access](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-tenant-access.md). Provider and directory qualification
+This implementation follows [the identity contract](https://github.com/keep-alert-operations/keep-design/blob/main/specs/spec-identity-configuration.md)
+and [tenant access](https://github.com/keep-alert-operations/keep-design/blob/main/specs/spec-tenant-access.md). Provider and directory qualification
 must be executed on the user's private nonproduction network. No company host,
 directory schema, credential, installed release or successful integration is implied.
 
 ## Implemented boundaries
 
-- `src/appchi/identity/oidc.py`: Authlib RS256 verification, exact issuer and
+- `src/keep/identity/oidc.py`: Authlib RS256 verification, exact issuer and
   audience/authorized-party checks, nonce, authentication time and explicit password
   evidence; confidential code flow with S256 PKCE; unknown-key refresh once;
   signed backchannel logout; identity-preserving refresh; bounded HTTPS clients.
@@ -55,22 +55,22 @@ Supply through the approved secret/configuration mechanism:
 
 | Setting | Required binding |
 |---|---|
-| `APPCHI_PUBLIC_ORIGIN` | Exact application HTTPS origin, no wildcard. |
-| `APPCHI_OIDC_ISSUER` | Exact dedicated environment realm issuer URL. |
-| `APPCHI_OIDC_CLIENT_ID` | Confidential client; default `appchi-web`. |
-| `APPCHI_OIDC_CLIENT_SECRET` | Environment-specific secret, server-side only. |
-| `APPCHI_OIDC_DIRECTORY_SOURCE` | Stable configured company directory source identifier. |
-| `APPCHI_OIDC_DIRECTORY_ID_CLAIM` | Protected, read-only immutable directory ID claim. |
-| `APPCHI_OIDC_DIRECTORY_SCOPE` | Scope supplying that protected claim. |
-| `APPCHI_OIDC_REQUIRED_ACR` | Exact protected claim value for the configured password sign-in policy. |
-| `APPCHI_OIDC_REQUIRED_AMR` | JSON array of required protected password methods; local Keycloak uses `["pwd"]`, without `otp`. |
-| `APPCHI_OIDC_CA_FILE` | Optional approved private-CA PEM path; system trust otherwise. |
-| `APPCHI_SUPERADMIN_GROUP` | Supplied immutable designated team identity; worker binds its source explicitly. |
+| `KEEP_PUBLIC_ORIGIN` | Exact application HTTPS origin, no wildcard. |
+| `KEEP_OIDC_ISSUER` | Exact dedicated environment realm issuer URL. |
+| `KEEP_OIDC_CLIENT_ID` | Confidential client; default `keep-web`. |
+| `KEEP_OIDC_CLIENT_SECRET` | Environment-specific secret, server-side only. |
+| `KEEP_OIDC_DIRECTORY_SOURCE` | Stable configured company directory source identifier. |
+| `KEEP_OIDC_DIRECTORY_ID_CLAIM` | Protected, read-only immutable directory ID claim. |
+| `KEEP_OIDC_DIRECTORY_SCOPE` | Scope supplying that protected claim. |
+| `KEEP_OIDC_REQUIRED_ACR` | Exact protected claim value for the configured password sign-in policy. |
+| `KEEP_OIDC_REQUIRED_AMR` | JSON array of required protected password methods; local Keycloak uses `["pwd"]`, without `otp`. |
+| `KEEP_OIDC_CA_FILE` | Optional approved private-CA PEM path; system trust otherwise. |
+| `KEEP_SUPERADMIN_GROUP` | Supplied immutable designated team identity; worker binds its source explicitly. |
 | Database, wrapping key and deployment epoch | Shared configuration described in delivery instructions. |
 
-Register exact `${APPCHI_PUBLIC_ORIGIN}/auth/callback`,
-`${APPCHI_PUBLIC_ORIGIN}/signed-out` and
-`${APPCHI_PUBLIC_ORIGIN}/auth/backchannel-logout` routes with Keycloak. Disable
+Register exact `${KEEP_PUBLIC_ORIGIN}/auth/callback`,
+`${KEEP_PUBLIC_ORIGIN}/signed-out` and
+`${KEEP_PUBLIC_ORIGIN}/auth/backchannel-logout` routes with Keycloak. Disable
 wildcards, local-user claim spoofing, direct grants, offline access and unsupported
 client flows. Require provider session IDs in backchannel notifications. Use the
 realm/client authentication, rotation and synchronization settings in the normative document.
@@ -122,11 +122,11 @@ These are assistant-selected implementation details, not changes to product scop
 
 ## Tests and private-network qualification
 
-From `appchi-api`, after `poetry check --lock` and `poetry sync --all-extras`:
+From `keep-api`, after `poetry check --lock` and `poetry sync --all-extras`:
 
 ```powershell
 poetry run python -m pytest tests/unit/test_identity_directory.py tests/unit/test_identity_ldap.py tests/unit/test_identity_oidc.py -q
-poetry run python -m ruff check src/appchi/identity tests/unit/test_identity*.py
+poetry run python -m ruff check src/keep/identity tests/unit/test_identity*.py
 ```
 
 The adapter suite uses real Authlib RSA signatures and controlled HTTP/LDAP failure
@@ -146,12 +146,12 @@ deadline during IPv6 fallback; the successful local run used `127.0.0.1` with a
 two-second connection deadline. No company Keycloak/LDAP compatibility run occurred.
 
 ```powershell
-$env:APPCHI_IDENTITY_TEST_ADMIN_URL = '<isolated-test-cluster-admin-DSN>'
+$env:KEEP_IDENTITY_TEST_ADMIN_URL = '<isolated-test-cluster-admin-DSN>'
 poetry run python -m pytest tests/unit/test_identity_sessions.py -q
 ```
 
 On the private nonproduction deployment, record actual versions/configuration and
-execute the full [identity acceptance list](https://github.com/appchi-alert-operations/appchi-design/blob/main/verification/verification-plan.md#identity):
+execute the full [identity acceptance list](https://github.com/keep-alert-operations/keep-design/blob/main/verification/verification-plan.md#identity):
 
 1. Fresh username/password login without OTP enrollment or challenge, SSO reuse, exact redirects, code/state/nonce
    replay rejection, same-origin CSRF, cookie properties and protected mapper rules.

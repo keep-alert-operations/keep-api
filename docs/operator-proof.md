@@ -1,10 +1,10 @@
 # Private operator serving-pool proof
 
-The API image provides `python -m appchi.operators.proof` as a separate, internal
+The API image provides `python -m keep.operators.proof` as a separate, internal
 HTTPS process for the synchronous operator executor. It has no background
 provisioning loop, retry scheduler, alert-admission route, migration runner or key
 decryption capability. Deployment composition and qualification belong to
-`appchi-delivery`; this document defines the executable interface.
+`keep-delivery`; this document defines the executable interface.
 
 ## Configuration and startup
 
@@ -17,16 +17,16 @@ origins for the two routes of one member are rejected.
 
 | Environment | Required value |
 | --- | --- |
-| `APPCHI_PROOF_CONFIG_FILE` | Path to the JSON configuration below. |
-| `APPCHI_OPERATOR_BINDING` | Path to the API's exact, qualified `OperatorBinding` JSON. |
-| `APPCHI_PROOF_DATABASE_URL` | Secret PostgreSQL DSN for the dedicated proof login. |
-| `APPCHI_DEPLOYMENT_EPOCH` | Same nonempty deployment epoch as the API. |
-| `APPCHI_PROOF_TOKEN_FILE` | Mounted secret text file: same bearer token as the API executor's probe credential. |
-| `APPCHI_PROOF_GATEWAY_TOKEN_FILE` | Mounted secret text file: shared private probe token configured on both Kong proof routes. |
-| `APPCHI_PROOF_CERT_FILE` | Mounted PEM server certificate, including its chain, for the helper's internal Service DNS. |
-| `APPCHI_PROOF_KEY_FILE` | Mounted PEM server private key. |
-| `APPCHI_BIND_HOST` | Optional listener address; default `0.0.0.0`. |
-| `APPCHI_BIND_PORT` | Optional HTTPS port; default `8443`. |
+| `KEEP_PROOF_CONFIG_FILE` | Path to the JSON configuration below. |
+| `KEEP_OPERATOR_BINDING` | Path to the API's exact, qualified `OperatorBinding` JSON. |
+| `KEEP_PROOF_DATABASE_URL` | Secret PostgreSQL DSN for the dedicated proof login. |
+| `KEEP_DEPLOYMENT_EPOCH` | Same nonempty deployment epoch as the API. |
+| `KEEP_PROOF_TOKEN_FILE` | Mounted secret text file: same bearer token as the API executor's probe credential. |
+| `KEEP_PROOF_GATEWAY_TOKEN_FILE` | Mounted secret text file: shared private probe token configured on both Kong proof routes. |
+| `KEEP_PROOF_CERT_FILE` | Mounted PEM server certificate, including its chain, for the helper's internal Service DNS. |
+| `KEEP_PROOF_KEY_FILE` | Mounted PEM server private key. |
+| `KEEP_BIND_HOST` | Optional listener address; default `0.0.0.0`. |
+| `KEEP_BIND_PORT` | Optional HTTPS port; default `8443`. |
 
 Both token files contain 32–512 ASCII characters without whitespace, apart from an
 optional surrounding newline. Do not pass tokens or keys as command-line arguments.
@@ -40,7 +40,7 @@ there is no insecure TLS switch. Environment proxy configuration is ignored for
 outbound member calls, and redirects are rejected.
 
 ```sh
-python -m appchi.operators.proof
+python -m keep.operators.proof
 ```
 
 The server provides `GET /readyz` and authenticated `POST /operator-check`; there
@@ -59,12 +59,12 @@ This initial helper supports an explicitly qualified, fixed pool of 1–16 membe
 Every `policy_url` and `auth_url` must target its member directly. A load-balanced
 Service URL cannot establish complete pool coverage. The isolated OpenShift
 example uses one StatefulSet member at
-`https://appchi-kong-0.appchi-kong-members:8443` and these existing plugin routes:
+`https://keep-kong-0.keep-kong-members:8443` and these existing plugin routes:
 
 | Route | Qualified configuration and behavior |
 | --- | --- |
-| `/__appchi/operator-check` | `appchi-policy` with `probe=true` and the private probe token; returns current policy, node identity and caller nonce. |
-| `/__appchi/operator-auth-check` | Real KeyAuth followed by `appchi-policy` with `probe_active=true` and the same private probe token; allowed credentials return policy/member evidence, inactive credentials return 401. |
+| `/__keep/operator-check` | `keep-policy` with `probe=true` and the private probe token; returns current policy, node identity and caller nonce. |
+| `/__keep/operator-auth-check` | Real KeyAuth followed by `keep-policy` with `probe_active=true` and the same private probe token; allowed credentials return policy/member evidence, inactive credentials return 401. |
 
 Both routes must terminate in the plugin. Neither may forward a request to alert
 admission. They need the same KeyAuth and policy behavior as the qualified workload
@@ -94,7 +94,7 @@ PostgreSQL transaction and checks:
 
 1. The restore advisory fence, restore status and deployment epoch. As in the
    normal runtime guard, a fresh database's NULL epoch is permitted; a non-NULL
-   epoch must match `APPCHI_DEPLOYMENT_EPOCH`. A transition from NULL to an epoch
+   epoch must match `KEEP_DEPLOYMENT_EPOCH`. A transition from NULL to an epoch
    during a proof invalidates the response. No manual epoch initialization is used.
 2. The current operator generation/revision, unfinished running operation, live
    operation lease, matching live global routing lease, and recorded executor
@@ -107,8 +107,8 @@ PostgreSQL transaction and checks:
 5. The same operation identity, lease token, operator revision, policy digest,
    deployment authority and credential disposition still hold after remote calls.
 
-The role contract is a dedicated `appchi_proof_login` with `INHERIT` membership in
-the existing `appchi_worker` role so existing worker RLS policies permit the
+The role contract is a dedicated `keep_proof_login` with `INHERIT` membership in
+the existing `keep_worker` role so existing worker RLS policies permit the
 required reads. Configure `default_transaction_read_only=on` on the login. The
 helper independently sets that connection option and starts each snapshot as
 `REPEATABLE READ READ ONLY`; it never assumes a migration/superuser identity and
@@ -171,11 +171,11 @@ python -m ruff check src tests
 
 `tests/integration/test_operator_proof_postgres.py` creates and drops a uniquely
 named database and login on an **isolated disposable** PostgreSQL cluster when
-`APPCHI_PROOF_TEST_POSTGRES_ADMIN_DSN` is set. It uses the real migration chain,
+`KEEP_PROOF_TEST_POSTGRES_ADMIN_DSN` is set. It uses the real migration chain,
 worker RLS inheritance and read-only connection pool, checks restore/lease/policy
 fences, and changes SQL authority during a mocked member call. Without that
 binding it skips. Keep its admin DSN outside logs and version control.
-Use the coordinated workspace environment with `appchi-migrations` installed for
+Use the coordinated workspace environment with `keep-migrations` installed for
 this optional suite; the API runtime itself does not depend on that package.
 The fixture prewarms its private pool with a bounded 15-second acquisition and
 establishes its mutation writer before the HTTP check. These checks establish SQL

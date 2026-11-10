@@ -8,9 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from appchi import live
-from appchi.live import REAUTHORIZE_SECONDS, LiveRegistry, events, refresh
-from appchi.shared.errors import AppError
+from keep import live
+from keep.live import REAUTHORIZE_SECONDS, LiveRegistry, events, refresh
+from keep.shared.errors import AppError
 
 TENANT = "00000000-0000-4000-8000-000000000001"
 

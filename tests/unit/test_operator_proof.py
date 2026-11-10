@@ -14,11 +14,11 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from appchi.operators.proof import (
+from keep.operators.proof import (
     ProofConfiguration, ProofFailure, ProofRequest, ProofService, Snapshot,
     create_app, read_snapshot,
 )
-from appchi.operators.worker import policy_document
+from keep.operators.worker import policy_document
 
 
 OPERATOR = UUID("00000000-0000-4000-8000-000000000001")
@@ -74,7 +74,7 @@ class Gateway:
     def __call__(self, req):
         self.calls.append(req)
         snapshot = self.snapshot
-        assert req.headers["X-Appchi-Probe-Token"] == GATEWAY_TOKEN
+        assert req.headers["X-Keep-Probe-Token"] == GATEWAY_TOKEN
         assert req.url.path in ("/policy", "/auth")
         if req.url.path == "/auth":
             assert req.headers["X-API-Key"] == KEY
@@ -303,7 +303,7 @@ async def test_startup_failure_is_sanitized_and_closes_resources(caplog):
 
 
 def test_database_startup_wait_is_bounded_and_pool_sessions_default_read_only(monkeypatch):
-    from appchi.operators import proof
+    from keep.operators import proof
 
     class Pool:
         def __init__(self, url, **kwargs):

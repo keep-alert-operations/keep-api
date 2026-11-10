@@ -9,8 +9,8 @@ import time
 from psycopg.errors import LockNotAvailable, QueryCanceled
 import pytest
 
-from appchi import live
-from appchi.live import publish_hints, redis_listener
+from keep import live
+from keep.live import publish_hints, redis_listener
 
 TENANTS = [f"00000000-0000-4000-8000-{n:012d}" for n in range(1, 4)]
 SETTINGS = SimpleNamespace(
@@ -19,7 +19,7 @@ SETTINGS = SimpleNamespace(
 
 
 def hint(tenant):
-    return {"type": "pmessage", "channel": f"appchi.test.tenant.{tenant}".encode("ascii")}
+    return {"type": "pmessage", "channel": f"keep.test.tenant.{tenant}".encode("ascii")}
 
 
 class Subscription:
@@ -35,7 +35,7 @@ class Subscription:
         return False
 
     async def psubscribe(self, pattern):
-        assert pattern == "appchi.test.tenant.*"
+        assert pattern == "keep.test.tenant.*"
 
     async def get_message(self, *, ignore_subscribe_messages, timeout):
         if not self.script:
@@ -155,8 +155,8 @@ def test_publication_deletes_only_published_rows_in_one_statement():
 
     assert publish_hints(database, SETTINGS, Publisher(), stop=stop) == 2
     assert Publisher.calls == [
-        (f"appchi.test.tenant.{TENANTS[0]}", "7"),
-        (f"appchi.test.tenant.{TENANTS[1]}", "8"),
+        (f"keep.test.tenant.{TENANTS[0]}", "7"),
+        (f"keep.test.tenant.{TENANTS[1]}", "8"),
     ]
     assert database.deletes == [(TENANTS[:2], [7, 8])]
     assert database.units == [(None, True), (None, True)]
@@ -184,7 +184,7 @@ def test_nothing_published_deletes_nothing():
 
 @pytest.mark.parametrize("timeout", [LockNotAvailable, QueryCanceled])
 def test_locked_outbox_row_defers_the_delete_without_failing(timeout, caplog):
-    caplog.set_level("INFO", logger="appchi.live")
+    caplog.set_level("INFO", logger="keep.live")
     database = Database(outbox(), locked=timeout)
     published = []
     publisher = SimpleNamespace(publish=lambda channel, data: published.append(channel))

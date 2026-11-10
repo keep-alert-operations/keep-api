@@ -1,16 +1,16 @@
 """ES response/transport control-flow tests, not an Elasticsearch substitute."""
 
-from appchi.cel.compiler import negate, suppressed_query
+from keep.cel.compiler import negate, suppressed_query
 from dataclasses import replace
 from datetime import UTC, datetime
 import time
 
 import pytest
 
-from appchi.cel import compile_expression
-from appchi.configuration.count_routes import DashboardPreview, PresetPreview
-from appchi.search.counts import CountReader, CountState
-from appchi.shared.errors import AppError
+from keep.cel import compile_expression
+from keep.configuration.count_routes import DashboardPreview, PresetPreview
+from keep.search.counts import CountReader, CountState
+from keep.shared.errors import AppError
 
 
 NOW = datetime(2026, 9, 22, 12, tzinfo=UTC)
@@ -250,7 +250,7 @@ def test_newest_first_previews_need_a_saved_preset_and_no_group():
 
 def test_stored_table_panels_read_back_with_their_rows():
     """Requirements: REV-63; dashboard operations 2 and 14."""
-    from appchi.configuration.routes import panel_row
+    from keep.configuration.routes import panel_row
 
     layout = {"id": "p", "title": None, "x": 0, "y": 0, "w": 6, "h": 4}
     assert panel_row(
@@ -263,8 +263,8 @@ def test_stored_table_panels_read_back_with_their_rows():
 
 def test_panel_links_are_stored_in_content_and_read_back():
     """Requirements: REV-66; dashboard operations 2 and 14."""
-    from appchi.configuration.models import DashboardDefinition
-    from appchi.configuration.routes import panel_content, panel_row
+    from keep.configuration.models import DashboardDefinition
+    from keep.configuration.routes import panel_content, panel_row
 
     link = {"url": "https://runbooks.example/a", "label": "Runbook"}
     layout = {"id": "00000000-0000-4000-8000-000000000010", "title": None,
@@ -289,7 +289,7 @@ def test_panel_links_are_stored_in_content_and_read_back():
 
 def test_servicenow_panels_are_not_counted_and_store_settings_in_content():
     """Requirements: REV-65; dashboard operations 2, 3 and 10."""
-    from appchi.configuration.routes import panel_content, panel_row
+    from keep.configuration.routes import panel_content, panel_row
 
     preset = "00000000-0000-4000-8000-000000000002"
     layout = {"title": None, "y": 0, "w": 3, "h": 2}

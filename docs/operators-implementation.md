@@ -15,7 +15,7 @@ operator generations fence stale completion. Copy is a separately authorized,
 audited response; ciphertext and secrets never appear in list/history payloads.
 Revocation immediately erases ciphertext and authoritative admission eligibility.
 
-Provisioning is request-owned (REV-34; [worker scope 3](https://github.com/appchi-alert-operations/appchi-design/blob/main/specs/spec-worker-scope.md#3-request-owned-operator-provisioning)).
+Provisioning is request-owned (REV-34; [worker scope 3](https://github.com/keep-alert-operations/keep-design/blob/main/specs/spec-worker-scope.md#3-request-owned-operator-provisioning)).
 No operator worker or background retry loop runs. The API commits the command and
 its operation first; `operators/synchronous.py` then runs that operation inside the
 same HTTP request, within a 90-second budget that starts no attempt with less than
@@ -56,7 +56,7 @@ If initial setup had a proposed name, replacement activation commits it only
 after the same full inventory, label and policy verification used by setup.
 
 Rename preserves the exact rule-label expression/value and unrelated rule fields.
-The route matcher is exactly `Appchi - {operator name}` = literal string `true`.
+The route matcher is exactly `Keep - {operator name}` = literal string `true`.
 Both old and proposed names remain claimed until verified completion. Cancellation
 reverses the persisted edits using fresh rule reads and checks for conflicts.
 Cancelling deletion of initial setup reuses its original prepared credential.
@@ -90,7 +90,7 @@ The only encoded profile is `grafana-provisioning-v1-kong-key-auth-v1`:
 - Kong database-backed Admin API: `/consumers/{id}` and deterministic credential
   `/consumers/{id}/key-auth/{credential_id}`, with `/key-auths/{credential_id}`
   ownership checking, credential inventory and root version read.
-- An explicitly supplied private readiness proof service. This is an Appchi
+- An explicitly supplied private readiness proof service. This is a Keep
   integration contract, **not an invented Kong Admin API endpoint**.
 
 The profile follows the official [Grafana legacy provisioning API](https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/api-legacy/alerting_provisioning/),
@@ -103,13 +103,13 @@ Grafana App Platform APIs and alternative Kong modes are not encoded profiles.
 
 This legacy profile requires a platform-enforced **controlled writer**, covering
 both the shared policy tree and affected rules. Direct competing UI/API writers
-must be restricted or routed through that coordinator. The Appchi SQL lease does
+must be restricted or routed through that coordinator. The Keep SQL lease does
 not establish this prerequisite. Complete inventory, bounded uncertain-write
 reconciliation, reserved resource namespaces, exact Unicode labels, secret fields,
 resolved delivery and pool proof must be qualified in the supplied environment.
 
 The company must first establish and verify the normative policy wrapper: managed
-Appchi routes followed by the preserved catch-all company branch, including its
+Keep routes followed by the preserved catch-all company branch, including its
 original defaults and complete ordered subtree. The executor rejects an absent
 wrapper and never bootstraps it speculatively. It reads fresh state, preserves the
 whole company branch and other operators' entries, updates only its own entries,
@@ -131,7 +131,7 @@ The following illustrates field names only; placeholders are not qualification:
   "grafana_url": "https://grafana.example.invalid",
   "kong_url": "https://kong-admin.example.invalid",
   "probe_url": "https://readiness.example.invalid/operator-check",
-  "webhook_url": "https://appchi-ingress.example.invalid/api/ingest/v2/grafana",
+  "webhook_url": "https://keep-ingress.example.invalid/api/ingest/v2/grafana",
   "grafana_version": "SUPPLIED-EXACT-VERSION",
   "kong_version": "SUPPLIED-EXACT-VERSION",
   "organization": 1,
@@ -168,7 +168,7 @@ token. Supply them through the deployment secret mechanism. For each provisionin
 request, `operators/synchronous.py` instantiates the adapter:
 
 ```python
-from appchi.operators.executor import configured_executor, PlatformCredentials
+from keep.operators.executor import configured_executor, PlatformCredentials
 
 adapter = configured_executor(
     settings.operator_binding, operator_db,
@@ -185,15 +185,15 @@ unsupported binding or capability fails the provisioning request with 503;
 unrelated APIs are unaffected.
 
 The Product API mounts the binding and management credentials. It wires this
-factory from `APPCHI_OPERATOR_BINDING` (the JSON file path),
-`APPCHI_OPERATOR_DATABASE_URL`, `APPCHI_OPERATOR_GRAFANA_TOKEN`,
-`APPCHI_OPERATOR_KONG_TOKEN` and `APPCHI_OPERATOR_PROBE_TOKEN`, alongside the
+factory from `KEEP_OPERATOR_BINDING` (the JSON file path),
+`KEEP_OPERATOR_DATABASE_URL`, `KEEP_OPERATOR_GRAFANA_TOKEN`,
+`KEEP_OPERATOR_KONG_TOKEN` and `KEEP_OPERATOR_PROBE_TOKEN`, alongside the
 normal database/envelope-key settings. The operator database URL uses the
 provisioning-role privileges through one shared connection per API process;
 ordinary API SQL keeps its RLS connection. Never mount these credentials into
 ingress or frontend. Supply secrets through the platform mechanism, without shell
 tracing. There is no operator worker to start: the `operators` role is deferred
-(REV-34) and `appchi.worker` rejects it.
+(REV-34) and `keep.worker` rejects it.
 
 ## Private readiness proof contract and security
 
@@ -240,7 +240,7 @@ malformed values are ignored, and shorter values never reduce normal backoff.
 ## Grafana ingress and evidence
 
 `map_webhook` validates the 4 MiB/100-member envelope, rejects truncation, preserves
-member order/original JSON bytes and records `appchi-grafana-v1` provenance with
+member order/original JSON bytes and records `keep-grafana-v1` provenance with
 native-equivalent mapped payloads. The HTTP ingress integration derives routing
 from authenticated PostgreSQL operator ownership and retained old/new name claims;
 labels never select authenticated tenancy. Grafana fingerprint/groupKey/startsAt
@@ -263,9 +263,9 @@ That run used the monorepo layout. The executor tests now live in this repositor
 and the repository/ledger tests in delivery; rerun them with:
 
 ```powershell
-# From appchi-api, after poetry sync --all-extras:
+# From keep-api, after poetry sync --all-extras:
 poetry run python -m pytest tests/unit/test_operator_executor.py -q
-# From appchi-delivery, with APPCHI_TEST_DATABASE_URL set to an isolated migrated test database:
+# From keep-delivery, with KEEP_TEST_DATABASE_URL set to an isolated migrated test database:
 .venv/Scripts/python.exe -m pytest tests/integration/test_operator_repository.py tests/integration/test_operator_executor_ledger.py -q
 ```
 

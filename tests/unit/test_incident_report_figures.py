@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from appchi.reports.figures import (
+from keep.reports.figures import (
     PeriodError,
     attach_assignments,
     breakdowns,

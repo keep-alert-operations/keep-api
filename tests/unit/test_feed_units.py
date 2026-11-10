@@ -7,10 +7,10 @@ from uuid import UUID
 
 import pytest
 
-from appchi import search_routes
-from appchi.search import SearchReader, SearchScope
-from appchi.shared.crypto import EnvelopeCipher
-from appchi.shared.errors import AppError
+from keep import search_routes
+from keep.search import SearchReader, SearchScope
+from keep.shared.crypto import EnvelopeCipher
+from keep.shared.errors import AppError
 
 TENANT = "00000000-0000-4000-8000-000000000001"
 HANDLE = b"\x01" * 32

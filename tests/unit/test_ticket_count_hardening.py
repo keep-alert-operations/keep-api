@@ -11,9 +11,9 @@ import httpx
 from pydantic import SecretStr
 import pytest
 
-from appchi.configuration import ticket_counts
-from appchi.configuration.ticket_count_routes import TicketCountQuery
-from appchi.configuration.ticket_counts import TicketCounts, parse_endpoint, query_url
+from keep.configuration import ticket_counts
+from keep.configuration.ticket_count_routes import TicketCountQuery
+from keep.configuration.ticket_counts import TicketCounts, parse_endpoint, query_url
 from test_ticket_counts import KEY, URL, Clock, Service, counter, run, streamed
 
 
@@ -176,7 +176,7 @@ def test_compressed_replies_are_refused_and_identity_is_asked_for():
     ],
 )
 def test_the_configured_query_is_kept_byte_for_byte(detection, query):
-    """Requirements: REV-65; dashboard operations 3 (Keep's query parameters)."""
+    """Requirements: REV-65; dashboard operations 3 (KeepHQ's query parameters)."""
     configured = (
         "https://tickets.example.com/c?key=a%20b%2Bc&debug&x=1&team=old"
         "&system%5Ffailure=yes&&format=&state=closed"
@@ -197,7 +197,7 @@ def test_a_configured_ca_file_alone_verifies_the_service(tmp_path):
     from cryptography.x509.oid import NameOID
 
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Appchi ticket test CA")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Keep ticket test CA")])
     now = datetime.now(UTC)
     certificate = (
         x509.CertificateBuilder()
@@ -215,7 +215,7 @@ def test_a_configured_ca_file_alone_verifies_the_service(tmp_path):
     settings = SimpleNamespace(ticket_count_url=SecretStr(URL), ticket_count_ca_file=str(path))
     context = TicketCounts.from_settings(settings).client._transport._pool._ssl_context
     subjects = [cert["subject"] for cert in context.get_ca_certs()]
-    assert subjects == [((("commonName", "Appchi ticket test CA"),),)]
+    assert subjects == [((("commonName", "Keep ticket test CA"),),)]
     assert context.verify_mode.name == "CERT_REQUIRED" and context.check_hostname
     default = TicketCounts.from_settings(SimpleNamespace(ticket_count_url=SecretStr(URL)))
     default_context = default.client._transport._pool._ssl_context

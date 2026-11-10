@@ -6,7 +6,7 @@ import pytest
 import uvicorn
 from uvicorn.server import ServerState
 
-from appchi.api_http import BoundedHttpToolsProtocol
+from keep.api_http import BoundedHttpToolsProtocol
 
 INVALID = b"Invalid HTTP request received."
 

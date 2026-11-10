@@ -7,7 +7,7 @@ import pytest
 import uvicorn
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 
-from appchi.api_http import BoundedHttpToolsProtocol
+from keep.api_http import BoundedHttpToolsProtocol
 
 
 async def _echo(scope, receive, send):
