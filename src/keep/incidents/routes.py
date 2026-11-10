@@ -14,6 +14,7 @@ from keep.incidents.models import (
     IncidentAssignment,
     IncidentContent,
     IncidentLinks,
+    IncidentTicket,
     IncidentMove,
 )
 from keep.shared.display_names import (
@@ -23,6 +24,7 @@ from keep.shared.display_names import (
     enrich_incidents,
 )
 from keep.shared.errors import AppError
+from keep.incidents.tickets import link_allowed
 from keep.shared.transactions import coordinator, command_result, revision, save_result
 from keep.serialization import wire
 from keep.correlation.runtime import resolve_context, reopen_context
@@ -239,6 +241,44 @@ def mutate(tenant, incident_id, body, request, operation):
                     "UPDATE incidents SET assignee_id=%s WHERE tenant_id=%s AND id=%s",
                     (body.assignee_id, tenant, incident_id),
                 )
+        elif operation == "ticket":
+            # REV-70: Keep stores the link only; it never calls ServiceNow.
+            before = (row["ticket_url"], row["ticket_number"])
+            after = (body.url, body.number)
+            changed = before != after
+            if changed and body.url is not None:
+                servicenow = getattr(request.app.state, "servicenow", None)
+                if servicenow is None:
+                    raise AppError(
+                        "servicenow_not_configured",
+                        "ServiceNow tickets are not set up in this deployment.",
+                        409,
+                    )
+                if not link_allowed(body.url, servicenow):
+                    raise AppError(
+                        "ticket_url_invalid",
+                        f"Only links to {servicenow.base_url} can be saved.",
+                        422,
+                    )
+            if changed:
+                linked = body.url is not None
+                conn.execute(
+                    "UPDATE incidents SET ticket_url=%s,ticket_number=%s,ticket_linked_at=%s,ticket_linked_by=%s WHERE tenant_id=%s AND id=%s",
+                    (
+                        body.url,
+                        body.number,
+                        now if linked else None,
+                        actor["id"] if linked else None,
+                        tenant,
+                        incident_id,
+                    ),
+                )
+                evidence = {
+                    "url": body.url,
+                    "number": body.number,
+                    "previous_url": before[0],
+                    "previous_number": before[1],
+                }
         elif operation == "content":
             changed = row["title"] != body.title or row["description"] != body.description
             if changed:
@@ -248,7 +288,8 @@ def mutate(tenant, incident_id, body, request, operation):
                 )
                 update_tokens(conn, tenant, incident_id)
         if changed:
-            activity(conn, row, now, actor["id"], operation, evidence)
+            # A ticket link records activity but is not incident work (REV-70).
+            activity(conn, row, now, actor["id"], operation, evidence, qualifying=operation != "ticket")
         flush_inline_effects(conn)
         result = get_incident(conn, tenant, incident_id)
         return save_result(
@@ -269,6 +310,12 @@ def status(tenant_id: str, incident_id: str, body: IncidentStatus, request: Requ
 @router.post("/{incident_id}/assignment")
 def assignment(tenant_id: str, incident_id: str, body: IncidentAssignment, request: Request):
     return mutate(tenant_id, incident_id, body, request, "assignment")
+
+
+@router.post("/{incident_id}/ticket")
+def ticket(tenant_id: str, incident_id: str, body: IncidentTicket, request: Request):
+    """Link, change or unlink the incident's ServiceNow ticket (REV-70)."""
+    return mutate(tenant_id, incident_id, body, request, "ticket")
 
 
 @router.patch("/{incident_id}")
