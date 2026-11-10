@@ -81,6 +81,10 @@ def create_app(settings=None, db=None):
 
         # REV-65: an invalid address is logged here and leaves ticket panels unconnected.
         app.state.ticket_counts = TicketCounts.from_settings(app.state.settings)
+        from keep.configuration.grafana_panel_routes import configured_origins
+
+        # REV-68: unusable Grafana entries are logged and ignored; start-up never fails here.
+        app.state.grafana_origins = configured_origins(app.state.settings)
         app.state.live_registry = LiveRegistry()
         listener = (
             asyncio.create_task(redis_listener(app.state.settings, app.state.live_registry))
@@ -147,6 +151,13 @@ def create_app(settings=None, db=None):
 
     app.include_router(ticket_counts)
     app.include_router(ticket_count_administration)
+    from keep.configuration.grafana_panel_routes import (
+        admin_router as grafana_panel_administration,
+        router as grafana_panels,
+    )
+
+    app.include_router(grafana_panels)
+    app.include_router(grafana_panel_administration)
     from keep.maintenance.routes import router as maintenance
 
     app.include_router(maintenance)

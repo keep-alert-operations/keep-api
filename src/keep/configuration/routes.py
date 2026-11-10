@@ -16,6 +16,7 @@ from keep.configuration.models import (
     referenced_presets_of,
     sanitize_panels,
 )
+from keep.configuration.grafana import GrafanaOrigins, grafana_url_problem
 from keep.configuration.image_routes import check_images, lock_images, mark_used
 from keep.shared.display_names import ActorPage, ActorRead, documented, enrich_actors
 from keep.shared.errors import AppError, unavailable
@@ -70,6 +71,9 @@ def panel_row(row):
             detection=content["detection"],
             thresholds=row["thresholds"],
         )
+    elif row["type"] == "grafana":
+        # A Grafana panel stores only its address; it is never counted (REV-68).
+        panel["url"] = row["content"]["url"]
     else:
         panel.update(preset_id=row["preset_id"], thresholds=row["thresholds"])
     return panel
@@ -93,6 +97,8 @@ def panel_content(panel):
         content.update(
             team=panel.team, ticket_state=panel.ticket_state, detection=panel.detection
         )
+    elif panel.type == "grafana":
+        content["url"] = panel.url
     return content
 
 
@@ -102,6 +108,20 @@ def sanitized(panels):
         return sanitize_panels(panels)
     except ValueError as exc:
         raise AppError("invalid_html", str(exc), 422) from None
+
+
+def check_grafana(request, panel, existing):
+    """Reject a new or changed Grafana panel address this deployment doesn't allow.
+
+    An address equal to the same stored panel's is accepted unchanged, so a dashboard
+    still saves after its Grafana is removed from the allowed list (REV-68).
+    """
+    if existing and (existing["content"] or {}).get("url") == panel.url:
+        return
+    origins = getattr(request.app.state, "grafana_origins", None) or GrafanaOrigins()
+    problem = grafana_url_problem(panel.url, origins, request.app.state.settings.public_origin)
+    if problem:
+        raise AppError("grafana_url_invalid", problem, 422)
 
 
 def save(request, tenant, table, body, resource_id=None):
@@ -151,7 +171,8 @@ def save(request, tenant, table, body, resource_id=None):
             lock_images(conn, tenant, images_of(body.panels))
             for panel in body.panels:
                 existing = conn.execute(
-                    "SELECT dashboard_id,type FROM dashboard_panels WHERE id=%s", (panel.id,)
+                    "SELECT dashboard_id,type,content FROM dashboard_panels WHERE id=%s",
+                    (panel.id,),
                 ).fetchone()
                 if existing and str(existing["dashboard_id"]) != resource_id:
                     raise AppError(
@@ -159,6 +180,8 @@ def save(request, tenant, table, body, resource_id=None):
                     )
                 if existing and existing["type"] != panel.type:
                     raise AppError("panel_type_changed", "A panel keeps its type.", 422)
+                if panel.type == "grafana":
+                    check_grafana(request, panel, existing)
         previous = get_definition(conn, tenant, table, resource_id, True) if resource_id else None
         if previous:
             revision(previous, body.expected_revision)
