@@ -90,7 +90,7 @@ The only encoded profile is `grafana-provisioning-v1-kong-key-auth-v1`:
 - Kong database-backed Admin API: `/consumers/{id}` and deterministic credential
   `/consumers/{id}/key-auth/{credential_id}`, with `/key-auths/{credential_id}`
   ownership checking, credential inventory and root version read.
-- An explicitly supplied private readiness proof service. This is an Keep
+- An explicitly supplied private readiness proof service. This is a Keep
   integration contract, **not an invented Kong Admin API endpoint**.
 
 The profile follows the official [Grafana legacy provisioning API](https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/api-legacy/alerting_provisioning/),
