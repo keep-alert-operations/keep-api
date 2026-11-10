@@ -44,3 +44,17 @@ team, state and detection at a time and runs at most 20 calls at once; see
 `keep.configuration.ticket_counts`. The optional `KEEP_TICKET_COUNT_CA_FILE`
 names a CA bundle that alone verifies the service's certificate. Startup sets the
 `httpx` and `httpcore` loggers to WARNING so request addresses are never logged.
+
+Grafana panels (REV-68) frame single Grafana panels from the Grafana instances
+listed in the optional setting `KEEP_GRAFANA_PANEL_ORIGINS`, mounted into this API
+(and the UI server). It is a comma-separated list of `https://` Grafana addresses,
+each an origin with an optional base path for a Grafana served under a sub-path,
+such as `https://grafana.example.com,https://tools.example.com/grafana`; plain
+`http://` is accepted only for a loopback host in local development. It is not a
+secret. Empty or unset turns Grafana panels off. Unusable entries, including Keep's
+own address, are ignored with one startup warning each and never fail startup; see
+`keep.configuration.grafana`. Saving a dashboard checks each new or changed Grafana
+panel address against the list (422 `grafana_url_invalid`); an unchanged address
+still saves after its Grafana is removed from the list. Tenant readers see the
+allowed list at `GET /api/tenants/{tenant_id}/grafana-panels/status`; super admins
+also see the ignored entries at `GET /api/admin/integrations/grafana-panels`.
