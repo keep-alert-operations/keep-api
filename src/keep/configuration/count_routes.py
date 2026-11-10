@@ -10,7 +10,15 @@ from pydantic import Field, field_validator, model_validator
 from keep.access import authorize
 from keep.cel import compile_expression
 from keep.cel.compiler import PROFILE
-from keep.configuration.models import DashboardDefinition, PresetDefinition, Sort, presets_of
+from keep.configuration.models import (
+    COUNTED_TYPES,
+    DashboardDefinition,
+    IncidentStatus,
+    PresetDefinition,
+    Sort,
+    incident_statuses,
+    presets_of,
+)
 from keep.configuration.routes import get_definition
 from keep.models import Command, StrictModel, uuid_string
 from keep.search import SearchReader, SearchScope, SearchState
@@ -32,6 +40,8 @@ class QuickCountQuery(StrictModel):
     cel: str = Field(default="true", max_length=16384)
     q: str = Field(default="", max_length=256)
     include_suppressed: bool = False
+    # Also count the incidents with these statuses that own matching alerts (REV-69).
+    incident_status: IncidentStatus | None = None
 
 
 class QuickCountRequest(StrictModel):
@@ -57,7 +67,12 @@ def quick_counts(tenant_id: str, body: QuickCountRequest, request: Request):
         before = _state(conn, tenant_id)
         evaluated_at = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
     queries = {
-        item.id: CountQuery(compile_expression(item.cel), item.q, item.include_suppressed)
+        item.id: CountQuery(
+            compile_expression(item.cel),
+            item.q,
+            item.include_suppressed,
+            incidents=item.incident_status is not None,
+        )
         for item in body.queries
     }
 
@@ -74,9 +89,16 @@ def quick_counts(tenant_id: str, body: QuickCountRequest, request: Request):
         revalidate=revalidate,
         deadline=deadline,
     )
+    wanted = {
+        item.id: (item.id, incident_statuses(item.incident_status))
+        for item in body.queries
+        if item.incident_status is not None
+    }
+    incidents = _incident_results(request, tenant_id, deadline, batch, wanted) if wanted else {}
     return {
         "data": {
             "counts": {key: str(value) for key, value in batch.counts.items()},
+            **({"incidents": incidents} if incidents else {}),
             "relative": any(query.expression.relative for query in queries.values()),
             "evaluated_at": batch.evaluated_at,
             "watermark": batch.watermark,
@@ -283,8 +305,8 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
         panels = (
             dashboard["panels"] if dashboard else [panel.model_dump() for panel in candidate.panels]
         )
-        # Only count panels are counted; other panel types reference no preset (REV-57).
-        panels = [panel for panel in panels if panel["type"] == "count"]
+        # Count and incident count panels are counted (REV-57, REV-69).
+        panels = [panel for panel in panels if panel["type"] in COUNTED_TYPES]
         if len(panels) > 24:
             raise unavailable("dashboard_definition_invalid")
         presets = _presets(conn, tenant, panels)
@@ -302,6 +324,18 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
         if context not in compiled:
             compiled[context] = compile_expression(preset["cel"])
         expressions[key] = compiled[context]
+    # An incident count panel's preset also reports the incidents owning its alerts,
+    # under its own key, so a count panel on the same preset is unchanged (REV-69).
+    compiled_of = dict(expressions)
+    for panel in panels:
+        if panel["type"] == "incident_count":
+            preset = str(panel["preset_id"])
+            expressions[INCIDENTS + preset] = CountQuery(compiled_of[preset], incidents=True)
+    # Keep the plain count only for presets a count panel shows, so a batch never has
+    # more queries than panels.
+    for preset in presets:
+        if not any(p["type"] == "count" and str(p["preset_id"]) == preset for p in panels):
+            del expressions[preset]
 
     def revalidate():
         with db.transaction() as conn:
@@ -318,7 +352,9 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
                     raise
                 if current["revision"] != dashboard["revision"]:
                     raise AppError("dashboard_changed", "Dashboard changed; retry the count.", 409)
-                current_panels = [panel for panel in current["panels"] if panel["type"] == "count"]
+                current_panels = [
+                    panel for panel in current["panels"] if panel["type"] in COUNTED_TYPES
+                ]
             try:
                 current_revisions = _revision_map(_presets(conn, tenant, current_panels))
             except AppError as exc:
@@ -341,12 +377,21 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
         deadline=deadline,
     )
     _budget(deadline)
+    wanted = {
+        _incident_key(panel): (
+            INCIDENTS + str(panel["preset_id"]),
+            incident_statuses(panel["incident_status"]),
+        )
+        for panel in panels
+        if panel["type"] == "incident_count"
+    }
+    incidents = _incident_results(request, tenant, deadline, batch, wanted) if wanted else {}
     data = {
         "observation_id": batch.observation_id,
         "dashboard_revision": expected,
         "preset_revisions": revisions,
         "evaluated_at": batch.evaluated_at,
-        "relative": any(expression.relative for expression in expressions.values()),
+        "relative": any(expression.relative for expression in compiled_of.values()),
         "watermark": batch.watermark,
         "observed": batch.observed,
         "updating": batch.updating,
@@ -357,13 +402,69 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
                 "panel_id": str(panel["id"]),
                 "preset_id": str(panel["preset_id"]),
                 "preset_name": presets[str(panel["preset_id"])]["name"],
-                "count": str(batch.counts[str(panel["preset_id"])]),
+                **(
+                    incidents[_incident_key(panel)]
+                    if panel["type"] == "incident_count"
+                    else {"count": str(batch.counts[str(panel["preset_id"])])}
+                ),
             }
             for panel in panels
         ],
     }
     headers = {"ETag": '"' + expected + '"'} if expected is not None else {}
     return JSONResponse({"data": wire(data), "meta": {"profile": PROFILE}}, headers=headers)
+
+
+INCIDENTS = "incidents:"
+
+
+def _incident_key(panel):
+    return INCIDENTS + str(panel["preset_id"]) + ":" + panel["incident_status"]
+
+
+def _incident_results(request, tenant, deadline, batch, wanted):
+    """Incident counts for ``wanted``: result key -> (batch key, stored statuses) (REV-69).
+
+    The search projection says which active incidents own matching alerts; PostgreSQL,
+    the authority, says which of them still have one of the statuses and an unretired
+    identity. Each result has ``count`` (incidents), ``alerts`` (matching alerts) and
+    ``linked_alerts`` (matching alerts in a counted incident) as decimal strings, or an
+    ``error`` when more incidents match than one count may hold.
+    """
+    found = batch.incidents or {}
+    owners = sorted(
+        {incident for batch_key, _ in wanted.values() for incident in found.get(batch_key) or {}}
+    )
+    status = {}
+    if owners:
+        with request.app.state.db.transaction() as conn:
+            _begin(conn, request, tenant, deadline)
+            rows = conn.execute(
+                """SELECT i.id,i.status FROM incidents i JOIN incident_identities x
+                ON x.tenant_id=i.tenant_id AND x.id=i.id
+                WHERE i.tenant_id=%s AND i.id=ANY(%s::uuid[]) AND x.retired_at IS NULL
+                AND i.status<>'resolved'""",
+                (tenant, owners),
+            ).fetchall()
+        status = {str(row["id"]): row["status"] for row in rows}
+    results = {}
+    for key, (batch_key, statuses) in wanted.items():
+        alerts = found.get(batch_key)
+        if alerts is None:
+            results[key] = {
+                "error": {
+                    "code": "incident_count_too_large",
+                    "message": "More incidents match than one panel can count.",
+                }
+            }
+            continue
+        counted = [n for incident, n in alerts.items() if status.get(incident) in statuses]
+        results[key] = {
+            "count": str(len(counted)),
+            "alerts": str(batch.counts[batch_key]),
+            "linked_alerts": str(sum(counted)),
+        }
+    return results
 
 
 @router.post("/dashboards/{dashboard_id}/counts")
