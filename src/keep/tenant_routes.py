@@ -22,7 +22,9 @@ class Grant(StrictModel):
 class TenantCreate(StrictModel):
     command_id: str
     name: str
-    initial_grants: list[Grant] = Field(min_length=1, max_length=100)
+    # Required but may be empty: a tenant created without grants starts without a
+    # local administrator, and its first permission batch must add one (REV-71).
+    initial_grants: list[Grant] = Field(max_length=100)
     _name = field_validator("name")(name)
     _command = field_validator("command_id")(uuid_string)
 
@@ -73,12 +75,16 @@ def valid_grants(conn, grants):
             raise unavailable("complete_membership_required")
 
 
-def require_local_admin(conn, tenant):
-    row = conn.execute(
+def local_admin_count(conn, tenant):
+    """Distinct eligible users reached through the tenant's own admin grants."""
+    return conn.execute(
         "SELECT count(DISTINCT p.id) AS n FROM principals p WHERE p.kind='user' AND p.eligible AND NOT p.deleted AND EXISTS(SELECT 1 FROM tenant_grants g WHERE g.tenant_id=%s AND g.role='admin' AND (g.principal_id=p.id OR g.principal_id IN(SELECT team_id FROM directory_memberships WHERE user_id=p.id)))",
         (tenant,),
-    ).fetchone()
-    if row["n"] == 0:
+    ).fetchone()["n"]
+
+
+def require_local_admin(conn, tenant):
+    if local_admin_count(conn, tenant) == 0:
         raise AppError(
             "last_admin_required", "At least one eligible local administrator is required.", 409
         )
@@ -120,7 +126,8 @@ def create(body: TenantCreate, request: Request):
                 "INSERT INTO tenant_grants(tenant_id,principal_id,role) VALUES(%s,%s,%s)",
                 (tenant, grant.principal_id, grant.role),
             )
-        require_local_admin(conn, tenant)
+        if body.initial_grants:
+            require_local_admin(conn, tenant)
         conn.execute("INSERT INTO tenant_work_state(tenant_id) VALUES(%s)", (tenant,))
         conn.execute("INSERT INTO tenant_view_state(tenant_id) VALUES(%s)", (tenant,))
         conn.execute("INSERT INTO tenant_configuration_guard(tenant_id) VALUES(%s)", (tenant,))
@@ -207,7 +214,10 @@ def permissions(tenant_id: str, request: Request):
         ).fetchall()
         return {
             "data": wire(rows),
-            "meta": {"revision": str(tenant["revision"])},
+            "meta": {
+                "revision": str(tenant["revision"]),
+                "has_local_admin": local_admin_count(conn, tenant_id) > 0,
+            },
             "next_cursor": None,
         }
 
