@@ -11,8 +11,10 @@ directory schema, credential, installed release or successful integration is imp
 
 - `src/keep/identity/oidc.py`: Authlib RS256 verification, exact issuer and
   audience/authorized-party checks, nonce, authentication time and explicit password
-  evidence; confidential code flow with S256 PKCE; unknown-key refresh once;
-  signed backchannel logout; identity-preserving refresh; bounded HTTPS clients.
+  evidence (`amr`); optional `acr` enforced only when a value is configured;
+  confidential code flow with S256 PKCE; unknown-key refresh once; identity-preserving
+  refresh; RP-initiated `end_session` logout plus a retained signed logout-token
+  validator the deployment no longer relies upon; bounded HTTPS clients.
 - `session.py`: PostgreSQL one-use encrypted login transactions and browser
   bindings; hashed opaque session handles, encrypted provider tokens and CSRF
   material; strict origin/CSRF checks; idle/absolute/deployment-epoch enforcement;
@@ -56,24 +58,53 @@ Supply through the approved secret/configuration mechanism:
 | Setting | Required binding |
 |---|---|
 | `KEEP_PUBLIC_ORIGIN` | Exact application HTTPS origin, no wildcard. |
-| `KEEP_OIDC_ISSUER` | Exact dedicated environment realm issuer URL. |
+| `KEEP_OIDC_ISSUER` | Exact dedicated Authelia issuer URL (its configured origin, no trailing slash). |
 | `KEEP_OIDC_CLIENT_ID` | Confidential client; default `keep-web`. |
 | `KEEP_OIDC_CLIENT_SECRET` | Environment-specific secret, server-side only. |
 | `KEEP_OIDC_DIRECTORY_SOURCE` | Stable configured company directory source identifier. |
 | `KEEP_OIDC_DIRECTORY_ID_CLAIM` | Protected, read-only immutable directory ID claim. |
 | `KEEP_OIDC_DIRECTORY_SCOPE` | Scope supplying that protected claim. |
-| `KEEP_OIDC_REQUIRED_ACR` | Exact protected claim value for the configured password sign-in policy. |
-| `KEEP_OIDC_REQUIRED_AMR` | JSON array of required protected password methods; local Keycloak uses `["pwd"]`, without `otp`. |
+| `KEEP_OIDC_REQUIRED_ACR` | **Optional.** Exact protected `acr` value for the configured password sign-in policy; enforced only when set. Leave unset for Authelia unless a specific authentication-context value is published. |
+| `KEEP_OIDC_REQUIRED_AMR` | JSON array of required protected password methods; Authelia password sign-in uses `["pwd"]`, without `otp`. |
 | `KEEP_OIDC_CA_FILE` | Optional approved private-CA PEM path; system trust otherwise. |
 | `KEEP_SUPERADMIN_GROUP` | Supplied immutable designated team identity; worker binds its source explicitly. |
 | Database, wrapping key and deployment epoch | Shared configuration described in delivery instructions. |
 
-Register exact `${KEEP_PUBLIC_ORIGIN}/auth/callback`,
-`${KEEP_PUBLIC_ORIGIN}/signed-out` and
-`${KEEP_PUBLIC_ORIGIN}/auth/backchannel-logout` routes with Keycloak. Disable
-wildcards, local-user claim spoofing, direct grants, offline access and unsupported
-client flows. Require provider session IDs in backchannel notifications. Use the
-realm/client authentication, rotation and synchronization settings in the normative document.
+Register the confidential `keep-web` client in Authelia's OpenID Connect provider
+(`identity_providers.oidc.clients`): authorization-code flow with PKCE `S256`
+enforced, `client_secret_basic` token-endpoint authentication, RS256 ID tokens,
+the exact redirect `${KEEP_PUBLIC_ORIGIN}/auth/callback` and post-logout redirect
+`${KEEP_PUBLIC_ORIGIN}/signed-out`. Disable wildcard redirects, implicit/hybrid and
+direct resource-owner grants, consent bypass for other parties, local-user claim
+spoofing and any public-client fallback. Grant only `openid`, `profile` and the
+dedicated directory-id scope below.
+
+The linchpin is the immutable directory-id claim. Expose the raw immutable LDAP
+attribute (for example `entryUUID` or `objectGUID`) to Authelia under
+`authentication_backend.ldap.attributes.extra` so it is carried unmodified, then
+define a `claims_policies` entry that writes exactly that attribute value into
+`${KEEP_OIDC_DIRECTORY_ID_CLAIM}` and attach that policy to a dedicated custom
+`scope` named `${KEEP_OIDC_DIRECTORY_SCOPE}` granted only to `keep-web`. The claim
+must be the raw attribute value verbatim — no normalization, re-encoding, truncation
+or substitution — because `ldap.py` publishes principals keyed by exactly that value
+and the backend correlates the token's directory-id claim against it. The client, the
+end user and every other scope must be unable to set or override this protected claim.
+
+Authelia emits `amr` from the authentication method it actually performed; require
+the password method so `${KEEP_OIDC_REQUIRED_AMR}` (e.g. `["pwd"]`) is satisfied. If
+a provider-specific `acr` value is configured in `${KEEP_OIDC_REQUIRED_ACR}`, publish
+that exact value; leaving it unset is supported and skips `acr` enforcement while the
+mandatory `amr` password evidence still applies.
+
+Back-channel logout is no longer relied upon. Sign-out performs local session
+revocation plus the idle/absolute/deployment-epoch TTLs enforced in `session.py`, and
+RP-initiated logout redirects the browser to Authelia's `end_session_endpoint` with
+`id_token_hint` and the registered post-logout redirect. The `/auth/logout` response
+returns `provider_logout_completed: false`, which the frontend tolerates; no
+provider-initiated back-channel notification is required for correct sign-out, and
+there is no startup dependency on back-channel logout being configured. The signed
+logout-token validator (`/auth/backchannel-logout`) and its revocation fences remain
+in the code and stay safe if a provider is ever configured to deliver such tokens.
 
 The LDAP adapter's `LDAPConfig` requires hostname, TLS port, read-only bind DN,
 secret, CA file and `LDAPSchema`. Supply actual base DN, user/team filters,
@@ -101,10 +132,13 @@ local test login or provider claim alone can create an authorized session.
 
 These are assistant-selected implementation details, not changes to product scope:
 
-- Require explicit protected `acr` and `amr` mappings so the backend can reject
-  authentication that lacks evidence of the configured password method. Configure and test the
-  supplied Keycloak release's protocol mappers; no claim values are guessed.
-- Discovery endpoints must be HTTPS under the configured realm origin/path.
+- Require an explicit protected `amr` mapping (and `acr` when a value is configured)
+  so the backend can reject authentication that lacks evidence of the configured
+  password method. Configure and test Authelia's claims policy and custom scope
+  definitions; no claim values are guessed. `acr` is optional because Authelia's
+  authentication-context value differs from Keycloak's, so it is enforced only when
+  `${KEEP_OIDC_REQUIRED_ACR}` is set.
+- Discovery endpoints must be HTTPS under the configured provider issuer origin/path.
   Redirect-following and environment proxy inheritance are disabled. Metadata and
   token responses are bounded at one MiB; token strings at 32 KiB. Network calls
   use a five-second default total request deadline and bounded connect/read waits.
@@ -130,7 +164,7 @@ poetry run python -m ruff check src/keep/identity tests/unit/test_identity*.py
 ```
 
 The adapter suite uses real Authlib RSA signatures and controlled HTTP/LDAP failure
-doubles. It does not establish company Keycloak or LDAP compatibility. Authlib and
+doubles. It does not establish company Authelia or LDAP compatibility. Authlib and
 ldap3 currently emit upstream deprecation warnings; their selected interfaces are
 locked by the repository dependencies and must be checked before upgrades.
 
@@ -143,7 +177,7 @@ Historical verification before the Poetry migration: 42 adapter tests passed; 8 
 passed in an automatically created and removed database; identity Ruff checks
 passed. Windows `localhost` initially exceeded the three-second pool acquisition
 deadline during IPv6 fallback; the successful local run used `127.0.0.1` with a
-two-second connection deadline. No company Keycloak/LDAP compatibility run occurred.
+two-second connection deadline. No company Authelia/LDAP compatibility run occurred.
 
 ```powershell
 $env:KEEP_IDENTITY_TEST_ADMIN_URL = '<isolated-test-cluster-admin-DSN>'
@@ -154,14 +188,14 @@ On the private nonproduction deployment, record actual versions/configuration an
 execute the full [identity acceptance list](https://github.com/keep-alert-operations/keep-design/blob/main/verification/verification-plan.md#identity):
 
 1. Fresh username/password login without OTP enrollment or challenge, SSO reuse, exact redirects, code/state/nonce
-   replay rejection, same-origin CSRF, cookie properties and protected mapper rules.
+   replay rejection, same-origin CSRF, cookie properties and protected claim-policy rules.
 2. Full direct/nested/cyclic/alternate-path and primary-group membership; disabled
    and recreated users; immutable rename behavior; unknown-user evidence denial.
 3. Paged LDAP failure, inaccessible subtrees and directory visibility delay. Verify
    that an explicit `directory --once` publication of a source change revokes open
    API/SSE access; the five-minute automatic propagation target is deferred with
    the directory worker (REV-35).
-4. Keycloak and LDAP independent outages, valid cached sessions without an identity
+4. Authelia and LDAP independent outages, valid cached sessions without an identity
    age cutoff, new-user admission restrictions and verified recovery publication.
 5. Concurrent tab refresh, rotation crash/ambiguity, signed logout replay and racing
    callbacks; no stale session survives verified disablement or deployment restore.
