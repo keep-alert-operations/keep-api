@@ -1,138 +1,41 @@
-"""Authorized cached selectors and optional bounded company-directory discovery.
+"""Authorized directory selectors, ADAPI picker search and save on pick (REV-73).
 
-Search never creates a principal or grants authority. Unknown live matches are
-queued for the existing complete-verification worker and remain unselectable.
+Requirements: REV-73; tenant access 5 and 12; worker scope 4; plan A11, A12, A14,
+A19, A22, A26.
+
+Search reads ADAPI (through the Redis search cache) and merges each row's stored
+state from PostgreSQL; it never creates a principal, queues a save or grants
+authority. Rows Keep has not saved return ``id: null``. Saving happens only
+through ``POST .../permission-principals/resolve`` (save on pick), polled with
+``GET .../permission-principals/resolve``.
 """
 
-from dataclasses import replace
 import hashlib
-import time
 import unicodedata
+from typing import Literal
 
 from fastapi import APIRouter, Request
-from ldap3 import SUBTREE
-from ldap3.core.exceptions import LDAPException
-from ldap3.utils.conv import escape_filter_chars
+from fastapi.responses import JSONResponse
 
 from keep.access import authorize
+from keep.identity.adapi import SOURCE, InvalidUsername, normalize_username
 from keep.identity.authentication import authenticate
+from keep.identity.directory import DirectoryUnavailable, PrincipalKey
+from keep.identity.saver import (
+    HandOver,
+    NotInDirectory,
+    Unsaved,
+    pending_row,
+    principal_row,
+    usable,
+)
 from keep.ingestion.native import canonical
+from keep.models import StrictModel
 from keep.shared.cursors import Cursor
 from keep.shared.errors import AppError, unavailable
 from keep.serialization import wire
 
-from .directory import DirectoryObject, DirectoryUnavailable
-from .ldap import LDAPDirectoryReader
-
 router = APIRouter(tags=["directory"])
-
-
-class ConfiguredDirectorySearch:
-    """Complete matching search within explicit qualified size/time allocations.
-
-    Bind this callable to app.state.directory_search. TLS/schema/credentials are
-    the same explicit LDAPConfig used by the worker. A result is complete only
-    after both type filters end with an empty paging cookie; no silent truncation.
-    """
-
-    def __init__(
-        self,
-        config,
-        *,
-        qualified,
-        max_seconds,
-        max_matches,
-        max_pages,
-        reader_factory=LDAPDirectoryReader,
-    ):
-        if qualified is not True or not config.schema.schema_qualified:
-            raise ValueError("Qualified LDAP search schema and capacity are required")
-        if type(max_seconds) not in (float, int) or not 0 < max_seconds <= 3:
-            raise ValueError("LDAP search allocation must be at most three seconds")
-        if any(type(value) is not int or value < 1 for value in (max_matches, max_pages)):
-            raise ValueError("Explicit bounded search allocations required")
-        if max_matches > config.max_objects or max_pages > config.max_pages:
-            raise ValueError("Search cannot exceed the qualified directory allocations")
-        self.config = replace(
-            config, connect_timeout=min(config.connect_timeout, 1), receive_timeout=1
-        )
-        self.max_seconds, self.max_matches, self.max_pages = max_seconds, max_matches, max_pages
-        self.reader_factory = reader_factory
-
-    def __call__(self, term):
-        _query(term)
-        deadline = time.monotonic() + self.max_seconds
-        found = {}
-        try:
-            with self.reader_factory(self.config) as reader:
-                schema = reader.schema
-                for kind, expression in (
-                    ("user", schema.user_filter),
-                    ("team", schema.team_filter),
-                ):
-                    cookie, cookies = None, set()
-                    query = (
-                        f"(&{expression}({schema.label_attribute}=*{escape_filter_chars(term)}*))"
-                    )
-                    for _ in range(self.max_pages):
-                        if time.monotonic() >= deadline:
-                            raise DirectoryUnavailable("directory_search_deadline")
-                        reader.connection.search(
-                            schema.base_dn,
-                            query,
-                            search_scope=SUBTREE,
-                            attributes=[
-                                schema.id_attribute,
-                                schema.label_attribute,
-                                schema.eligibility_attribute,
-                            ],
-                            time_limit=1,
-                            paged_size=min(self.config.page_size, self.max_matches),
-                            paged_criticality=True,
-                            paged_cookie=cookie,
-                        )
-                        if (
-                            reader.connection.result.get("result") != 0
-                            or time.monotonic() >= deadline
-                        ):
-                            raise DirectoryUnavailable("directory_search_incomplete")
-                        for entry in reader.connection.response:
-                            if entry.get("type") != "searchResEntry":
-                                raise DirectoryUnavailable("directory_search_referral")
-                            key = reader._key(entry)
-                            label = reader._one(entry, schema.label_attribute).decode("utf-8")
-                            eligible = True
-                            if kind == "user":
-                                status = reader._one(entry, schema.eligibility_attribute).decode(
-                                    "utf-8"
-                                )
-                                eligible = (
-                                    not (int(status) & schema.disabled_bitmask)
-                                    if schema.disabled_bitmask is not None
-                                    else status in schema.eligibility_values
-                                )
-                            obj = DirectoryObject(key, kind, label, bool(eligible))
-                            if key in found and found[key] != obj:
-                                raise DirectoryUnavailable("directory_search_identity_conflict")
-                            found[key] = obj
-                            if len(found) > self.max_matches:
-                                raise DirectoryUnavailable("directory_search_allocation_exceeded")
-                        control = reader.connection.result.get("controls", {}).get(
-                            "1.2.840.113556.1.4.319", {}
-                        )
-                        cookie = control.get("value", {}).get("cookie")
-                        if cookie is None:
-                            raise DirectoryUnavailable("directory_search_page_unproven")
-                        if not cookie:
-                            break
-                        if cookie in cookies:
-                            raise DirectoryUnavailable("directory_search_page_loop")
-                        cookies.add(cookie)
-                    else:
-                        raise DirectoryUnavailable("directory_search_page_allocation_exceeded")
-        except (LDAPException, OSError, UnicodeError, ValueError):
-            raise DirectoryUnavailable("directory_search_unavailable") from None
-        return tuple(found[key] for key in sorted(found))
 
 
 def _query(q):
@@ -196,7 +99,7 @@ def _listing(request, tenant, mode, q, limit, cursor, team=None):
     if mode != "members":
         _query(q)
     # Remote discovery happens after authorization and before the coherent local
-    # read/queue transaction; it cannot publish accepted identity or grants.
+    # read transaction; it never writes, publishes identity or grants.
     live, search_failed = None, False
     discovery = getattr(request.app.state, "directory_search", None)
     if mode == "principals" and discovery is not None:
@@ -246,13 +149,14 @@ def _listing(request, tenant, mode, q, limit, cursor, team=None):
         position = None
         decoded = codec.decode(cursor) if cursor else None
         if live is not None:
-            result = _live_rows(conn, live)
+            result = _search_rows(conn, live.objects)
             revision["search"] = hashlib.sha256(
                 canonical(
                     [
                         (p.key.source, p.key.object_id, p.label, p.kind, p.eligible, p.deleted)
-                        for p in live
+                        for p in live.objects
                     ]
+                    + [live.capped]
                 )
             ).hexdigest()
             revision["coverage"] = "directory"
@@ -298,13 +202,21 @@ def _listing(request, tenant, mode, q, limit, cursor, team=None):
                 else None
             )
             rows = [_present(row) for row in rows]
+        # An answer from the search cache may be out of date, and a capped answer is
+        # incomplete: neither is presented as the complete company directory.
         metadata.update(
-            cached=live is None,
-            search_complete=live is not None,
-            complete_company_directory=live is not None,
+            cached=live is None or live.cached,
+            search_complete=live is not None and not live.capped,
+            complete_company_directory=live is not None and not live.cached and not live.capped,
             directory_degraded=bool(metadata["directory_degraded"] or search_failed),
-            coverage="configured_directory" if live is not None else "accepted_cache",
+            coverage="accepted_cache"
+            if live is None
+            else "search_cache"
+            if live.cached
+            else "configured_directory",
             membership_scope="eligible_users" if team else None,
+            # ADAPI answered its silent 1,000-row cap: the picker asks to type more.
+            type_more=bool(live is not None and live.capped),
         )
         return {
             "data": wire(rows[:limit]),
@@ -315,25 +227,24 @@ def _listing(request, tenant, mode, q, limit, cursor, team=None):
         }
 
 
-def _live_rows(conn, live):
-    keys = [(obj.key.source, obj.key.object_id) for obj in live]
+def _search_rows(conn, objects):
+    """ADAPI matches with each saved principal's stored state merged in; writes nothing.
+
+    A saved row shows what is stored (id, label, eligibility, selectable). A row
+    Keep has not saved has ``id: null`` and is not selectable: picking it saves
+    it first through ``.../permission-principals/resolve``.
+    """
     rows = conn.execute(
         """SELECT p.*,r.semantic_digest AS membership_digest FROM principals p
         LEFT JOIN directory_root_checkpoints r ON r.root_id=p.id
         WHERE (p.directory_source,p.object_id) IN (SELECT * FROM unnest(%s::text[],%s::text[]))""",
-        ([key[0] for key in keys], [key[1] for key in keys]),
+        ([obj.key.source for obj in objects], [obj.key.object_id for obj in objects]),
     ).fetchall()
     known = {(row["directory_source"], row["object_id"]): row for row in rows}
     result = []
-    for obj in live:
+    for obj in objects:
         stored = known.get((obj.key.source, obj.key.object_id))
-        same = stored and (
-            stored["display_name"],
-            stored["kind"],
-            stored["eligible"],
-            stored["deleted"],
-        ) == (obj.label, obj.kind, obj.eligible, obj.deleted)
-        row = (
+        result.append(
             _present(stored)
             if stored
             else {
@@ -342,26 +253,13 @@ def _live_rows(conn, live):
                 "object_id": obj.key.object_id,
                 "kind": obj.kind,
                 "display_name": obj.label,
-                "eligible": obj.eligible,
                 "deleted": obj.deleted,
                 "verified_at": None,
-                "verification": "verification_pending",
+                "eligible": obj.eligible and not obj.deleted,
+                "verification": "unverified",
                 "selectable": False,
             }
         )
-        if not same or row["verification"] != "verified":
-            row.update(
-                display_name=obj.label,
-                eligible=obj.eligible,
-                deleted=obj.deleted,
-                selectable=False,
-                verification="verification_pending",
-            )
-            conn.execute(
-                "INSERT INTO directory_verification_requests(source,object_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
-                (obj.key.source, obj.key.object_id),
-            )
-        result.append(row)
     return result
 
 
@@ -416,3 +314,130 @@ def members(
 @router.get("/api/tenants/{tenant_id}/assignees")
 def assignees(tenant_id: str, request: Request, q: str, limit: int = 50, cursor: str | None = None):
     return _listing(request, tenant_id, "assignees", q, limit, cursor)
+
+
+# Save on pick (REV-73) ---------------------------------------------------------------
+
+
+class ResolveBody(StrictModel):
+    kind: Literal["user", "team"]
+    username: str
+    retry: bool = False
+
+
+def _principal_key(username: str) -> PrincipalKey:
+    """Sign-in username rules (identity 2) and no ``*``; lowercase samAccountName."""
+    try:
+        if "*" in username:
+            raise InvalidUsername("username contains a wildcard")
+        return PrincipalKey(SOURCE, normalize_username(username))
+    except InvalidUsername:
+        raise AppError(
+            "invalid_username", "Enter a directory username without special characters.", 422
+        ) from None
+
+
+def _saver(request):
+    saver = getattr(request.app.state, "pick_saver", None)
+    if saver is None:
+        # ADAPI or the super-admin group is not configured for this API process.
+        raise unavailable("directory_unavailable")
+    return saver
+
+
+def _saved(row):
+    return {"data": wire(_present(row)), "meta": {}}
+
+
+def _pending():
+    return JSONResponse({"data": {"status": "pending"}, "meta": {}}, status_code=202)
+
+
+def _failed(reason):
+    return AppError(reason, "Keep couldn't save this from the directory. Try again.", 503)
+
+
+_NOT_SAVED = {
+    "principal_not_in_directory": "The directory has no user or group with this username.",
+    "principal_ambiguous": "More than one directory entry has this username.",
+    "principal_kind_mismatch": "The directory entry with this username is of another kind.",
+}
+
+
+@router.post("/api/tenants/{tenant_id}/permission-principals/resolve")
+def resolve(tenant_id: str, body: ResolveBody, request: Request):
+    """Save a picked principal: 200 saved, 202 pending, 422 not in ADAPI, 503 failed.
+
+    Order: a pending row (failed -> 503 unless ``retry``; leased -> 202; otherwise
+    hand over -> 202), then a stored usable principal (200, no ADAPI read), then
+    an inline save (200, or 202 when it does not fit the request).
+    """
+    key = _principal_key(body.username)
+    db = request.app.state.db
+
+    def admin(conn):
+        authorize(conn, request, tenant_id, "admin", mutation=True)
+
+    with db.transaction() as conn:
+        admin(conn)
+        pending = pending_row(conn, key)
+        if pending is None:
+            row = principal_row(conn, key)
+            if usable(row, body.kind):
+                return _saved(row)
+            saver = _saver(request)
+        elif pending["last_failure"] and not body.retry:
+            raise _failed(pending["last_failure"])
+        elif pending["leased"]:
+            return _pending()
+        else:
+            # A failure retried, or a save whose process stopped: hand it over again.
+            queue = _saver(request).hand_over(
+                conn, key, pending["kind"], retry=bool(pending["last_failure"])
+            )
+    if pending is not None:
+        queue()
+        return _pending()
+    try:
+        return _saved(saver.save_inline(key, body.kind, admin))
+    except HandOver:
+        with db.transaction() as conn:
+            admin(conn)
+            queue = saver.hand_over(conn, key, body.kind)
+        queue()
+        return _pending()
+    except Unsaved as failure:
+        with db.transaction() as conn:
+            admin(conn)
+            recorded = saver.record_failure(conn, key, body.kind, failure.reason)
+        if not recorded:
+            # Another request is saving it in the background right now.
+            return _pending()
+        raise _failed(failure.reason) from None
+    except NotInDirectory as missing:
+        raise AppError(missing.code, _NOT_SAVED[missing.code], 422) from None
+
+
+@router.get("/api/tenants/{tenant_id}/permission-principals/resolve")
+def resolve_status(tenant_id: str, request: Request, kind: Literal["user", "team"], username: str):
+    """Poll a save; reads PostgreSQL only, never ADAPI.
+
+    200 saved and usable; 202 leased or queued (a pending row without a live lease
+    is handed over again); 503 failed with its ``last_failure``; 404 no save.
+    """
+    key = _principal_key(username)
+    with request.app.state.db.transaction() as conn:
+        authorize(conn, request, tenant_id, "admin")
+        row = principal_row(conn, key)
+        if usable(row, kind):
+            return _saved(row)
+        pending = pending_row(conn, key)
+        if pending is None:
+            raise AppError("not_found", "No save is in progress for this username.", 404)
+        if pending["last_failure"]:
+            raise _failed(pending["last_failure"])
+        if pending["leased"]:
+            return _pending()
+        queue = _saver(request).hand_over(conn, key, pending["kind"])
+    queue()
+    return _pending()

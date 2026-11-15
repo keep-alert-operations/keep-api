@@ -1564,4 +1564,4 @@ test = ["aiohttp (>=3.10.5)", "flake8 (>=6.1,<7.0)", "mypy (>=0.800)", "psutil",
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "92aa3a8cada90a42bfc4d7ae004ce5ddec1d192d0a9bceb76feff1ce00f8c10f"
+content-hash = "57522ff8bd8c9d7c4e6c78b10d8b3c781ee2e0a28fb1fc2fcd63f60ad7b292dc"

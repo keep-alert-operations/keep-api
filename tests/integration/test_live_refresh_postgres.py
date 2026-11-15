@@ -47,8 +47,8 @@ def stream(real_db, tenant):
             (tenant, principal),
         )
         conn.execute(
-            "INSERT INTO auth_sessions(handle_hash,principal_id,issuer,subject,provider_sid,csrf_hash,csrf_cipher,auth_time,activity_at,absolute_at,deployment_epoch) VALUES(%s,%s,'https://test.invalid',%s,%s,%s,%s,clock_timestamp(),clock_timestamp(),clock_timestamp()+interval '1 day','test')",
-            (hashed, principal, str(principal), str(principal), hashlib.sha256(b"csrf").digest(), b"unused"),
+            "INSERT INTO auth_sessions(handle_hash,principal_id,csrf_hash,csrf_cipher,auth_time,absolute_at,deployment_epoch) VALUES(%s,%s,%s,%s,clock_timestamp(),clock_timestamp()+interval '1 day','test')",
+            (hashed, principal, hashlib.sha256(b"csrf").digest(), b"unused"),
         )
     database = Database(os.environ["KEEP_TEST_DATABASE_URL"], deployment_epoch="test")
     api = ApiDatabase(database)
