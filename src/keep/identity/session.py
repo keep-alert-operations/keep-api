@@ -14,13 +14,18 @@ password or the typed username (people sometimes type a password into that field
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import secrets
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from psycopg import Error as DatabaseError
+from psycopg_pool import PoolTimeout
 from starlette.concurrency import run_in_threadpool
 
 from keep import request_budget
@@ -53,9 +58,82 @@ from keep.identity.login import (
 )
 from keep.identity.publication import allocate_generation, lock_identity, publish, stored_matches
 from keep.ingestion.native import parse_json
+from keep.observability import log_event, register
+from keep.observability.http import actor
 from keep.shared.errors import AppError
 
 log = logging.getLogger(__name__)
+
+# Sign-in outcomes (REV-74, observability 5). A sign-in that reaches the username check
+# ends in exactly one of completed, rejected or unavailable, also when it fails outside
+# its own checks (the database, the gate, the request's time); each is counted and timed.
+# None of these records carries the typed username or the password. A completed one
+# names the person by ID.
+register(
+    "sign_in_completed",
+    logging.INFO,
+    "Signed in",
+    "A person signed in and a 24-hour session was created. user.id is the person.",
+    required=("principal_id",),
+    outcome="success",
+    text="sign_in_completed",
+)
+register(
+    "sign_in_rejected",
+    logging.INFO,
+    "Sign-in rejected: {reason}",
+    "The person was answered 401 or 403. invalid_username and empty_password are refused "
+    "before any bind; invalid_credentials is the directory refusing the bind; "
+    "whoami_mismatch is a bind that named another account; account_not_in_directory and "
+    "account_ambiguous come from the person's directory row; account_disabled and "
+    "account_ineligible from the stored person. Many invalid_credentials in a short time "
+    "can be password guessing.",
+    required=("reason",),
+    outcome="failure",
+    text="sign_in_rejected reason=%(reason)s",
+)
+register(
+    "sign_in_unavailable",
+    logging.WARNING,
+    "Sign-in unavailable: {reason}",
+    "The person could not sign in and it was not their doing. dependency names what "
+    "failed: ldap (the bind), adapi (reading the person's directory row) or postgresql. "
+    "request_budget_spent means too little of the request's time was left to save the "
+    "sign-in; configuration_missing is explained by sign_in_configuration_missing. Any "
+    "other reason is the error code the person was answered with after the username check: "
+    "database_unavailable, human_authorization_gated (the restore gate closed), "
+    "request_timeout (the request's time ended first, whatever sign-in concluded "
+    "afterwards), internal_error (an unexpected error; http_unhandled_error has its class "
+    "and stack) or request_cancelled (the process was stopping).",
+    required=("reason",),
+    outcome="failure",
+    text="sign_in_unavailable reason=%(reason)s",
+)
+register(
+    "sign_in_configuration_missing",
+    logging.WARNING,
+    "Sign-in settings are missing or invalid: KEEP_LDAP_HOST, KEEP_LDAP_BIND_FORMAT, "
+    "KEEP_ADAPI_URL, KEEP_ADAPI_CLIENT_ID and KEEP_SUPERADMIN_GROUP are required",
+    "Written once per process, without values. Sign-in answers 503 until KEEP_LDAP_HOST, "
+    "KEEP_LDAP_BIND_FORMAT, KEEP_ADAPI_URL, KEEP_ADAPI_CLIENT_ID and KEEP_SUPERADMIN_GROUP "
+    "are set and the process is restarted.",
+    outcome="failure",
+    text="sign_in_configuration_missing: KEEP_LDAP_HOST, KEEP_LDAP_BIND_FORMAT, "
+    "KEEP_ADAPI_URL, KEEP_ADAPI_CLIENT_ID and KEEP_SUPERADMIN_GROUP are required",
+)
+register(
+    "sign_in_publication_fenced",
+    logging.INFO,
+    "A newer directory publication already holds this person",
+    "Sign-in read a changed directory row, but a newer publication had stored the person "
+    "first, so the stored row decided the sign-in. Nothing to do.",
+    outcome="unknown",
+    text="sign_in_publication_fenced",
+)
+
+# A reason is one of the fixed codes raised by the bind and the directory client. Anything
+# else, such as an error's own text, is recorded as "other": it could name a person.
+_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 router = APIRouter(prefix="/auth", tags=["identity"])
 
@@ -90,13 +168,63 @@ def _unavailable() -> AppError:
     )
 
 
-def _refused(reason: str) -> AppError:
-    log.info("sign_in_rejected reason=%s", reason)
+def _reason(value) -> str:
+    return value if isinstance(value, str) and _REASON.fullmatch(value) else "other"
+
+
+def _outside_reason(error: BaseException) -> str:
+    """The reason for a sign-in ended by an error outside its own checks.
+
+    It is the error code the HTTP layer answers that error with.
+    """
+    if isinstance(error, AppError):
+        return _reason(error.code)
+    if isinstance(error, (DatabaseError, PoolTimeout)):
+        return "database_unavailable"
+    if isinstance(error, asyncio.CancelledError):
+        return "request_cancelled"
+    return "internal_error"
+
+
+class _Attempt:
+    """One sign-in from the username check on: it writes exactly one outcome event."""
+
+    def __init__(self, since: float) -> None:
+        self.since, self.settled = since, False
+
+    def settle(self, event: str, **fields) -> bool:
+        """Write the outcome unless one is written. True when it was written as given."""
+        if self.settled:
+            return False
+        self.settled = True
+        on_time = True
+        try:
+            request_budget.remaining()
+        except AppError as late:
+            # The request's time ended first, so the caller was answered with this code
+            # whatever sign-in concluded afterwards.
+            on_time, event, fields = False, "sign_in_unavailable", {"reason": _reason(late.code)}
+        log_event(log, event, duration=time.perf_counter() - self.since, **fields)
+        return on_time
+
+    def failed(self, error: BaseException) -> None:
+        """An error outside sign-in's own checks. It keeps its answer and is counted."""
+        reason = _outside_reason(error)
+        dependency = "postgresql" if reason == "database_unavailable" else None
+        self.settle("sign_in_unavailable", reason=reason, dependency=dependency)
+
+
+def _note_rejected(reason: str, attempt: _Attempt) -> None:
+    attempt.settle("sign_in_rejected", reason=_reason(reason))
+
+
+def _refused(reason: str, attempt: _Attempt) -> AppError:
+    _note_rejected(reason, attempt)
     return _rejected()
 
 
-def _down(reason: str) -> AppError:
-    log.warning("sign_in_unavailable reason=%s", reason)
+def _down(reason: str, attempt: _Attempt, dependency: str | None = None) -> AppError:
+    attempt.settle("sign_in_unavailable", reason=_reason(reason), dependency=dependency)
     return _unavailable()
 
 
@@ -129,10 +257,7 @@ def sign_in_config(app) -> SignInConfig | None:
             principal_key(settings.superadmin_group or "", adapi.source),
         )
     except ValueError:
-        log.warning(
-            "sign_in_configuration_missing: KEEP_LDAP_HOST, KEEP_LDAP_BIND_FORMAT, "
-            "KEEP_ADAPI_URL, KEEP_ADAPI_CLIENT_ID and KEEP_SUPERADMIN_GROUP are required"
-        )
+        log_event(log, "sign_in_configuration_missing")
     app.state.sign_in_config = config
     return config
 
@@ -216,28 +341,40 @@ async def login(request: Request):
     # Identity configuration 2, checks before any bind, in order: the gate, the exact
     # same Origin with this endpoint's body and encoding limits, the username, then
     # the password.
+    since = time.perf_counter()
     await run_in_threadpool(check_gate)
     same_origin(request)
     body = await _login_body(request)
+    attempt = _Attempt(since)
+    try:
+        return await _sign_in(request, body, attempt)
+    except BaseException as error:
+        attempt.failed(error)
+        raise
+
+
+async def _sign_in(request: Request, body: dict, attempt: _Attempt):
+    """Sign-in from the username check on; ``login`` counts any error this does not."""
+    database = request.app.state.db
     try:
         username = normalize_username(body["username"])
     except InvalidUsername:
-        raise _refused("invalid_username") from None
+        raise _refused("invalid_username", attempt) from None
     password = body.pop("password")
     if not password:
-        raise _refused("empty_password")
+        raise _refused("empty_password", attempt)
     return_to = _return_path(body.get("return_to"))
     config = sign_in_config(request.app)
     if config is None:
-        raise _unavailable()
+        raise _down("configuration_missing", attempt)
 
     # The bind and WhoAmI: LDAP connect 2 s and receive 2 s, in a worker thread.
     try:
         await run_in_threadpool(check_password, config.ldap, username, password)
     except SignInRejected as exc:
-        raise _refused(exc.args[0]) from None
+        raise _refused(exc.args[0], attempt) from None
     except SignInUnavailable as exc:
-        raise _down(exc.args[0]) from None
+        raise _down(exc.args[0], attempt, "ldap") from None
     finally:
         del password
 
@@ -257,14 +394,15 @@ async def login(request: Request):
     try:
         rows = await run_in_threadpool(read_rows)
     except DirectoryUnavailable as exc:
-        raise _down(exc.args[0] if exc.args else "directory_unavailable") from None
+        reason = exc.args[0] if exc.args else "directory_unavailable"
+        raise _down(reason, attempt, "adapi") from None
     if not rows:
-        log.info("sign_in_rejected reason=account_not_in_directory")
+        _note_rejected("account_not_in_directory", attempt)
         raise AppError(
             "account_not_in_directory", "Your account isn't in the company directory.", 403
         )
     if len(rows) > 1:
-        log.info("sign_in_rejected reason=account_ambiguous")
+        _note_rejected("account_ambiguous", attempt)
         raise AppError(
             "account_ambiguous",
             "More than one directory account has this username. Contact your administrator.",
@@ -273,10 +411,11 @@ async def login(request: Request):
     try:
         evidence = user_evidence(config.adapi.source, rows[0], generation, started_at)
     except DirectoryUnavailable as exc:
-        raise _down(exc.args[0] if exc.args else "directory_unavailable") from None
+        reason = exc.args[0] if exc.args else "directory_unavailable"
+        raise _down(reason, attempt, "adapi") from None
     person = evidence.objects[next(iter(evidence.roots))]
     if not _budget_left():
-        raise _down("request_budget_spent")
+        raise _down("request_budget_spent", attempt)
 
     settings = request.app.state.settings
     cipher = settings.cipher()
@@ -287,9 +426,9 @@ async def login(request: Request):
     def finish():
         """Publish the person's changed row, then create the session, in one transaction.
 
-        Returns the session's absolute deadline, or None when sign-in is refused. A
-        refusal still commits the publication, so a confirmed disablement ends the
-        person's other sessions (identity configuration 3, 8).
+        Returns the person's ID and the session's absolute deadline, or None when
+        sign-in is refused. A refusal still commits the publication, so a confirmed
+        disablement ends the person's other sessions (identity configuration 3, 8).
         """
         with database.transaction() as conn:
             lock_identity(conn)
@@ -298,7 +437,7 @@ async def login(request: Request):
                 result = publish(conn, evidence, superadmin_group=config.superadmin_group)
                 if result.fenced:
                     # A newer publication holds the person; its stored row decides.
-                    log.info("sign_in_publication_fenced")
+                    log_event(log, "sign_in_publication_fenced")
             if not person.eligible:
                 return None
             principal = conn.execute(
@@ -322,7 +461,7 @@ async def login(request: Request):
                     WHERE handle_hash=%s AND revoked_at IS NULL""",
                     (_hash(old_handle),),
                 )
-            return conn.execute(
+            deadline = conn.execute(
                 """INSERT INTO auth_sessions(handle_hash,principal_id,csrf_hash,csrf_cipher,
                     auth_time,absolute_at,deployment_epoch)
                 SELECT %s,%s,%s,%s,t.signed_in,t.signed_in+interval '24 hours',%s
@@ -336,10 +475,17 @@ async def login(request: Request):
                     settings.deployment_epoch,
                 ),
             ).fetchone()["absolute_at"]
+            return principal["id"], deadline
 
-    absolute_at = await run_in_threadpool(finish)
-    if absolute_at is None:
-        raise _refused("account_disabled" if not person.eligible else "account_ineligible")
+    signed_in = await run_in_threadpool(finish)
+    if signed_in is None:
+        reason = "account_disabled" if not person.eligible else "account_ineligible"
+        raise _refused(reason, attempt)
+    principal_id, absolute_at = signed_in
+    # Written after the session's transaction committed: the request's own record and
+    # the event both name the person by ID, never by username.
+    if attempt.settle("sign_in_completed", principal_id=principal_id):
+        actor(request, principal_id)
     response = JSONResponse(
         {
             "data": {"return_to": return_to, "absolute_at": absolute_at.isoformat()},

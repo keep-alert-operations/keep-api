@@ -1,5 +1,6 @@
 import json
 import asyncio
+import logging
 from contextlib import suppress
 from contextlib import asynccontextmanager
 from threading import Event
@@ -10,12 +11,18 @@ from keep.db import Database
 
 
 from keep.http import create_http_app
+from keep.observability import configure_logging, log_event, start_metrics_server
+
+log = logging.getLogger(__name__)
 
 
 def create_app(settings=None, db=None):
     @asynccontextmanager
     async def lifespan(app):
         app.state.settings = settings or Settings()
+        configure_logging("api", role=app.state.settings.role)
+        start_metrics_server()
+        log_event(log, "process_started", role=app.state.settings.role)
         from keep.workload import HTTP_ROLES
 
         if app.state.settings.role not in HTTP_ROLES:
@@ -116,6 +123,7 @@ def create_app(settings=None, db=None):
         try:
             yield
         finally:
+            log_event(log, "process_stopping", role=app.state.settings.role, reason="shutdown")
             # Drain the bounded thread turn before closing its shared SQL pool.
             publisher_stop.set()
             if publisher:
@@ -152,6 +160,9 @@ def create_app(settings=None, db=None):
 
     app.include_router(auth)
     app.include_router(alerts)
+    from keep.rum import router as rum
+
+    app.include_router(rum)
     from keep.configuration.routes import router as configuration
     from keep.incidents.routes import router as incidents
     import keep.incidents.history  # noqa: F401 -- registers incident child routes
