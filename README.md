@@ -1,6 +1,6 @@
 # keep-api
 
-Product HTTP API, OIDC sessions, scoped commands, operator provisioning and live/SSE updates.
+Product HTTP API, password sign-in and local sessions, ADAPI picker search and save on pick, scoped commands, operator provisioning and live/SSE updates.
 
 See [system design](https://github.com/keep-alert-operations/keep-design), [workspace setup](https://github.com/keep-alert-operations/keep-delivery) and [source provenance](SOURCE.md).
 

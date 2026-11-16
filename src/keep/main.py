@@ -54,9 +54,17 @@ def create_app(settings=None, db=None):
         ):
             raise RuntimeError("A qualified capacity profile is required outside development")
         from keep.live import LiveRegistry, hint_publisher, redis_listener
+        from keep.identity.saver import PickSaver
+        from keep.identity.search_cache import SearchCache
         from keep.identity.selection_config import configured_search
 
-        app.state.directory_search = configured_search(app.state.settings)
+        # REV-73: picker search reads ADAPI through a non-authoritative Redis cache;
+        # save on pick publishes inline or hands over to this process's saver thread.
+        app.state.search_cache = SearchCache.from_settings(app.state.settings)
+        owned_search_cache = app.state.search_cache
+        app.state.directory_search = configured_search(app.state.settings, app.state.search_cache)
+        app.state.pick_saver = PickSaver.from_settings(app.state.db, app.state.settings)
+        owned_pick_saver = app.state.pick_saver
 
         from elasticsearch import Elasticsearch
         from keep.service_clients import elasticsearch_options
@@ -112,6 +120,14 @@ def create_app(settings=None, db=None):
             publisher_stop.set()
             if publisher:
                 await publisher
+            # REV-73: stop ADAPI reads, release this process's leases and join the
+            # saver thread before its SQL pool closes; the next poll restarts saves.
+            savers = [owned_pick_saver]
+            if app.state.pick_saver is not owned_pick_saver:
+                savers.append(app.state.pick_saver)
+            for saver in savers:
+                if saver is not None:
+                    await asyncio.to_thread(saver.close)
             if listener:
                 listener.cancel()
                 with suppress(asyncio.CancelledError):
@@ -121,6 +137,8 @@ def create_app(settings=None, db=None):
                 owned_recovery_store.close()
             if owned_search_client:
                 await asyncio.to_thread(owned_search_client.close)
+            if owned_search_cache:
+                await asyncio.to_thread(owned_search_cache.close)
             if app.state.operator_db:
                 app.state.operator_db.close()
             if not db and app.state.db:

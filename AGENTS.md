@@ -1,6 +1,6 @@
 # keep-api
 
-Product HTTP API, OIDC sessions, scoped commands, operator provisioning and live/SSE updates.
+Product HTTP API, password sign-in and local sessions, ADAPI picker search and save on pick, scoped commands, operator provisioning and live/SSE updates.
 
 Read the workspace-level `../AGENTS.md` and instructions scoped to affected files.
 Choose task-relevant sources from the [context map](../keep-design/context/map.md)
