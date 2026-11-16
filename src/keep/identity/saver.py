@@ -151,10 +151,15 @@ def principal_row(conn, key: PrincipalKey):
 
 
 def usable(row, kind: str) -> bool:
-    """A saved, verified principal of ``kind``; a team also needs its root checkpoint."""
+    """A saved, verified principal of ``kind``; a team also needs its root checkpoint.
+
+    A tombstone isn't usable: picking the name reads ADAPI again, since a refresh never
+    rereads a deleted principal that nothing references.
+    """
     return bool(
         row is not None
         and row["kind"] == kind
+        and not row["deleted"]
         and row["verified_at"] is not None
         and row["evidence_generation"] >= 1
         and (kind == "user" or row["checkpointed"])
