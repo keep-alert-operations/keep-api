@@ -244,6 +244,10 @@ def _search_rows(conn, objects):
     result = []
     for obj in objects:
         stored = known.get((obj.key.source, obj.key.object_id))
+        if stored and stored["deleted"] and not obj.deleted:
+            # A stored tombstone ADAPI lists again isn't a saved principal (saver.usable):
+            # show it unsaved, so picking it saves it again through resolve.
+            stored = None
         result.append(
             _present(stored)
             if stored
