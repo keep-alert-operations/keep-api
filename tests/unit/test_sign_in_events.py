@@ -4,6 +4,7 @@ The sign-in doubles and helpers are those of test_password_login: a fake LDAP
 connection, a fake ADAPI client and a recording database.
 
 Requirements: REV-74; observability 5 and 7. REV-73; identity configuration 3, 13.
+REV-76 (no disabled refusal; an unusable stored person is a 503); plan (REV-75/76) B3.
 """
 
 # ruff: noqa: F811 -- the imported fixtures are requested by name
@@ -109,10 +110,6 @@ def two_rows():
     FakeADAPI.rows = FakeADAPI.rows * 2
 
 
-def disabled():
-    FakeADAPI.rows = [{"sAMAccountName": TYPED, "userAccountControl": "514"}]
-
-
 @pytest.mark.parametrize(
     ("arrange", "sent", "status", "reason"),
     [
@@ -121,7 +118,6 @@ def disabled():
         (wrong_account, credentials(TYPED), 401, "whoami_mismatch"),
         (no_row, credentials(TYPED), 403, "account_not_in_directory"),
         (two_rows, credentials(TYPED), 403, "account_ambiguous"),
-        (disabled, credentials(TYPED), 401, "account_disabled"),
     ],
 )
 def test_a_rejected_sign_in_is_one_event_with_its_reason(
@@ -130,8 +126,6 @@ def test_a_rejected_sign_in_is_one_event_with_its_reason(
     """Requirements: REV-74; observability 5 and 7. REV-73; identity configuration 3."""
     if arrange:
         arrange()
-    if arrange is disabled:
-        monkeypatch.setattr(session, "stored_matches", lambda conn, obj: False)
     before, timings = counted("sign_in_rejected", "failure", reason), timed("sign_in_rejected")
     response = post(api.client, sent)
     assert response.status_code == status, response.text
@@ -365,3 +359,37 @@ def test_a_fenced_publication_is_recorded_and_the_sign_in_still_completes(
     names = [r["event"]["action"] for r in events(records())]
     assert names == ["sign_in_publication_fenced", "sign_in_completed"]
     assert counted("sign_in_publication_fenced", "unknown") == before + 1
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [{"eligible": False}, {"deleted": True}],
+    ids=["stored-ineligible", "stored-deleted"],
+)
+def test_a_fenced_publication_leaving_the_person_unusable_is_a_retryable_503(
+    api, records, monkeypatch, stored
+):
+    """A newer publication from an earlier version holds the person unusable.
+
+    Sign-in answers 503 sign_in_unavailable (reason stored_person_unusable) and
+    creates no session the next request would reject.
+
+    Requirements: REV-76; identity configuration 3, 8; plan B3.
+    """
+    monkeypatch.setattr(session, "stored_matches", lambda conn, obj: False)
+    monkeypatch.setattr(
+        session, "publish", lambda conn, evidence, **kw: SimpleNamespace(fenced=True)
+    )
+    api.db.principal.update(stored)
+    before = counted("sign_in_unavailable", "failure", "stored_person_unusable")
+    response = post(api.client, credentials(TYPED))
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "sign_in_unavailable"
+    assert not api.db.sql("INSERT INTO auth_sessions") and "set-cookie" not in response.headers
+    written = records()
+    names = [r["event"]["action"] for r in events(written)]
+    assert names == ["sign_in_publication_fenced", "sign_in_unavailable"]
+    (event,) = [r for r in events(written) if r["event"]["action"] == "sign_in_unavailable"]
+    assert event["keep"]["reason"] == "stored_person_unusable"
+    assert counted("sign_in_unavailable", "failure", "stored_person_unusable") == before + 1
+    assert_names_nobody(written)

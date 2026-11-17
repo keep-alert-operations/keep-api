@@ -5,7 +5,8 @@ check what reaches LDAP, ADAPI and PostgreSQL for each refused or accepted reque
 Real PostgreSQL, OpenLDAP and the mock ADAPI are exercised in keep-delivery's
 tests/integration/test_password_login.py.
 
-Requirements: REV-73; identity configuration 2-5, 9-10; plan "Login API", A3, A9, A10, A20.
+Requirements: REV-73; REV-76; identity configuration 2-5, 9-10; plan "Login API", A3, A9,
+A10, A20; plan (REV-75/76) B3.
 """
 
 from __future__ import annotations
@@ -312,16 +313,22 @@ def test_whoami_naming_another_account_is_refused_without_reading_adapi(api):
             403,
             "account_ambiguous",
         ),
-        ([{"sAMAccountName": "jdoe", "userAccountControl": "514"}], 401, "authentication_rejected"),
-        ([{"sAMAccountName": "jdoe"}], 503, "sign_in_unavailable"),
+        # REV-76: a disabled account's UAC, or none at all, no longer decides anything.
+        ([{"sAMAccountName": "jdoe", "userAccountControl": "514"}], 200, None),
+        ([{"sAMAccountName": "jdoe"}], 200, None),
+        ([{"displayName": "No name"}], 503, "sign_in_unavailable"),
     ],
 )
 def test_directory_answers_decide_after_a_correct_bind(api, rows, status, code):
-    """Requirements: REV-73; identity configuration 3; plan A4, A20."""
+    """Requirements: REV-73; REV-76; identity configuration 3; plan A4, A20; B3."""
     FakeADAPI.rows = rows
     response = post(api.client, credentials())
-    assert response.status_code == status and response.json()["error"]["code"] == code
-    assert not api.db.sql("INSERT INTO auth_sessions")
+    assert response.status_code == status, response.text
+    if code is None:
+        assert len(api.db.sql("INSERT INTO auth_sessions")) == 1
+    else:
+        assert response.json()["error"]["code"] == code
+        assert not api.db.sql("INSERT INTO auth_sessions")
 
 
 def test_directory_outage_and_spent_budget_answer_503_with_nothing_published(api, monkeypatch):
@@ -366,16 +373,24 @@ def test_missing_sign_in_settings_answer_503_while_the_app_serves(api):
             assert post(client, credentials()).status_code == 503
 
 
-def test_a_changed_or_disabled_person_is_published_and_disabled_is_refused(api, monkeypatch):
-    """Requirements: REV-73; identity configuration 3, 8; plan A23."""
+def test_a_changed_person_is_published_and_signs_in(api, monkeypatch):
+    """A changed person is published as eligible, never refused, never a negative fact.
+
+    Requirements: REV-73; REV-76; identity configuration 3, 8; plan A23; B3.
+    """
     monkeypatch.setattr(session, "stored_matches", lambda conn, obj: False)
     assert post(api.client, credentials()).status_code == 200
     FakeADAPI.rows = [{"sAMAccountName": "jdoe", "userAccountControl": "514"}]
     response = post(api.client, credentials())
-    assert response.status_code == 401
+    assert response.status_code == 200, response.text
     first, second = api.doubles.published
-    assert first.negative_keys == frozenset() and len(second.negative_keys) == 1
-    assert len(api.db.sql("INSERT INTO auth_sessions")) == 1
+    assert first.negative_keys == frozenset() and second.negative_keys == frozenset()
+    assert all(obj.eligible for obj in second.objects.values())
+    assert len(api.db.sql("INSERT INTO auth_sessions")) == 2
+    # The only session sign-in ends is this browser's own earlier one.
+    for text, params in api.db.statements:
+        if text.startswith("UPDATE auth_sessions"):
+            assert "WHERE handle_hash=%s" in text and len(params) == 1
 
 
 def test_an_old_cookie_is_revoked_by_a_new_sign_in(api):
