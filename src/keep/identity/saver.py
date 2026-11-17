@@ -38,7 +38,6 @@ from keep.identity.adapi import (
     INLINE_VERIFY_DEADLINE,
     JOB_CALL_CAP,
     REQUEST_CALL_CAP,
-    USER_ATTRIBUTES,
     ADAPIClient,
     ADAPIConfig,
     exact_params,
@@ -154,7 +153,8 @@ def usable(row, kind: str) -> bool:
     """A saved, verified principal of ``kind``; a team also needs its root checkpoint.
 
     A tombstone isn't usable: picking the name reads ADAPI again, since a refresh never
-    rereads a deleted principal that nothing references.
+    rereads a deleted principal that nothing references. Nor is a person stored
+    ineligible by an earlier version: the pick rereads and lifts them (REV-76).
     """
     return bool(
         row is not None
@@ -162,7 +162,7 @@ def usable(row, kind: str) -> bool:
         and not row["deleted"]
         and row["verified_at"] is not None
         and row["evidence_generation"] >= 1
-        and (kind == "user" or row["checkpointed"])
+        and (row["eligible"] if kind == "user" else row["checkpointed"])
     )
 
 
@@ -181,16 +181,18 @@ def _left() -> float | None:
 def _classify_root(config: ADAPIConfig, key: PrincipalKey, kind: Kind, transport, stop) -> None:
     """After the root lookup failed inline, tell an ambiguous name (422) from an outage.
 
-    At most two exact calls on this failure path only; any error keeps the outage.
+    At most two exact calls on this failure path only; any error keeps the outage. A
+    person is read from ``/users/user`` (REV-76), a group from ``/groups``.
     """
-    attributes = {"user": USER_ATTRIBUTES, "team": GROUP_ATTRIBUTES}
     try:
         with ADAPIClient(
             config, call_cap=REQUEST_CALL_CAP, stop=stop, transport=transport
         ) as client:
             for endpoint in (kind, "team" if kind == "user" else "user"):
-                find = client.find_users if endpoint == "user" else client.find_groups
-                rows = find(exact_params(key.object_id, attributes[endpoint]))
+                if endpoint == "user":
+                    rows = client.exact_user(key.object_id)
+                else:
+                    rows = client.find_groups(exact_params(key.object_id, GROUP_ATTRIBUTES))
                 if len(rows) > 1:
                     raise NotInDirectory(AMBIGUOUS)
                 if rows:

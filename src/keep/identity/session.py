@@ -1,6 +1,6 @@
 """Keep password sign-in and PostgreSQL-authoritative human sessions (REV-73).
 
-Requirements: REV-73; identity configuration 2-5, 8-10; plan "Login API".
+Requirements: REV-73; REV-76; identity configuration 2-5, 8-10; plan "Login API".
 
 ``POST /auth/login`` checks the password with one LDAP bind (``keep.identity.login``),
 reads the person's own ADAPI row and creates a local 24-hour session. ``GET
@@ -85,9 +85,9 @@ register(
     "The person was answered 401 or 403. invalid_username and empty_password are refused "
     "before any bind; invalid_credentials is the directory refusing the bind; "
     "whoami_mismatch is a bind that named another account; account_not_in_directory and "
-    "account_ambiguous come from the person's directory row; account_disabled and "
-    "account_ineligible from the stored person. Many invalid_credentials in a short time "
-    "can be password guessing.",
+    "account_ambiguous come from the person's directory row. AD refuses a disabled "
+    "account's bind, so it is an invalid_credentials too (REV-76). Many "
+    "invalid_credentials in a short time can be password guessing.",
     required=("reason",),
     outcome="failure",
     text="sign_in_rejected reason=%(reason)s",
@@ -99,7 +99,10 @@ register(
     "The person could not sign in and it was not their doing. dependency names what "
     "failed: ldap (the bind), adapi (reading the person's directory row) or postgresql. "
     "request_budget_spent means too little of the request's time was left to save the "
-    "sign-in; configuration_missing is explained by sign_in_configuration_missing. Any "
+    "sign-in; configuration_missing is explained by sign_in_configuration_missing; "
+    "stored_person_unusable means the person's stored row was still unusable after "
+    "sign-in published it, because a newer publication from an earlier version holds it "
+    "(REV-76; a later sign-in or refresh lifts it). Any "
     "other reason is the error code the person was answered with after the username check: "
     "database_unavailable, human_authorization_gated (the restore gate closed), "
     "request_timeout (the request's time ended first, whatever sign-in concluded "
@@ -158,7 +161,8 @@ LOGIN_BODY_SCHEMA = {
 
 
 def _rejected() -> AppError:
-    # One message for a wrong password, a WhoAmI mismatch and a disabled account.
+    # One message for a wrong password (AD refuses a disabled account's bind the same
+    # way), a WhoAmI mismatch and a person the directory doesn't confirm.
     return AppError("authentication_rejected", "The username or password wasn't accepted.", 401)
 
 
@@ -426,9 +430,10 @@ async def _sign_in(request: Request, body: dict, attempt: _Attempt):
     def finish():
         """Publish the person's changed row, then create the session, in one transaction.
 
-        Returns the person's ID and the session's absolute deadline, or None when
-        sign-in is refused. A refusal still commits the publication, so a confirmed
-        disablement ends the person's other sessions (identity configuration 3, 8).
+        Returns the person's ID and the session's absolute deadline, or None when the
+        stored row is still unusable after publishing (a fenced publication: a newer
+        one from an earlier version holds the person ineligible or deleted). The
+        publication commits either way; it never ends a session (REV-76).
         """
         with database.transaction() as conn:
             lock_identity(conn)
@@ -438,8 +443,6 @@ async def _sign_in(request: Request, body: dict, attempt: _Attempt):
                 if result.fenced:
                     # A newer publication holds the person; its stored row decides.
                     log_event(log, "sign_in_publication_fenced")
-            if not person.eligible:
-                return None
             principal = conn.execute(
                 """SELECT id,kind,eligible,deleted,evidence_generation,verified_at FROM principals
                 WHERE directory_source=%s AND object_id=%s""",
@@ -479,8 +482,9 @@ async def _sign_in(request: Request, body: dict, attempt: _Attempt):
 
     signed_in = await run_in_threadpool(finish)
     if signed_in is None:
-        reason = "account_disabled" if not person.eligible else "account_ineligible"
-        raise _refused(reason, attempt)
+        # Never a session the next request would reject: retry once a later sign-in or
+        # refresh has lifted the stored row (REV-76, plan B3).
+        raise _down("stored_person_unusable", attempt)
     principal_id, absolute_at = signed_in
     # Written after the session's transaction committed: the request's own record and
     # the event both name the person by ID, never by username.
