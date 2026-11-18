@@ -211,96 +211,16 @@ def save(request, tenant, table, body, resource_id=None):
                 fp,
                 {"data": public(previous), "meta": {"revision": str(previous["revision"])}},
             )
-        now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
-        resource_id = resource_id or str(uuid4())
-        rev = previous["revision"] + 1 if previous else 1
-        common = (
-            resource_id,
+        result, rev = write_revision(
+            conn,
             tenant,
-            body.name,
-            name_key(body.name),
-            rev,
-            now,
-            now,
-            actor["id"],
-            actor["id"],
-        )
-        if table == "presets":
-            conn.execute(
-                "INSERT INTO presets(id,tenant_id,name,name_key,revision,created_at,updated_at,created_by,updated_by,cel,profile,sort,columns,group_by,noisy) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,name_key=EXCLUDED.name_key,revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by,cel=EXCLUDED.cel,sort=EXCLUDED.sort,columns=EXCLUDED.columns,group_by=EXCLUDED.group_by,noisy=EXCLUDED.noisy",
-                common
-                + (
-                    body.cel,
-                    "keep-cel-v1",
-                    Jsonb(definition["sort"]),
-                    Jsonb(definition["columns"]),
-                    definition["group_by"],
-                    definition["noisy"],
-                ),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO dashboards(id,tenant_id,name,name_key,revision,created_at,updated_at,created_by,updated_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,name_key=EXCLUDED.name_key,revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by",
-                common,
-            )
-            conn.execute(
-                "DELETE FROM dashboard_panels WHERE tenant_id=%s AND dashboard_id=%s",
-                (tenant, resource_id),
-            )
-            mark_used(conn, tenant, images_of(body.panels), now)
-            for panel in body.panels:
-                counted = panel.type in ("count", "servicenow", "incident_count")
-                image = panel.type == "image"
-                conn.execute(
-                    "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,type,preset_id,image_id,title,x,y,w,h,thresholds,content) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (
-                        panel.id,
-                        tenant,
-                        resource_id,
-                        panel.type,
-                        panel.preset_id if panel.type in PRESET_TYPES else None,
-                        panel.image_id if image else None,
-                        panel.title,
-                        panel.x,
-                        panel.y,
-                        panel.w,
-                        panel.h,
-                        Jsonb([t.model_dump() for t in panel.thresholds] if counted else []),
-                        Jsonb(panel_content(panel)),
-                    ),
-                )
-        result = get_definition(conn, tenant, table, resource_id)
-        conn.execute(
-            sql.SQL(
-                "INSERT INTO {}(tenant_id,id,revision,snapshot,recorded_at,actor_id) VALUES(%s,%s,%s,%s,%s,%s)"
-            ).format(sql.Identifier(TABLES[table])),
-            (tenant, resource_id, rev, Jsonb(public(result)), now, actor["id"]),
-        )
-        conn.execute(
-            "INSERT INTO configuration_activity(id,tenant_id,resource_kind,resource_id,revision,kind,command_id,actor_id,actor_label,before_revision,after_revision,recorded_at,changed_fields) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                uuid4(),
-                tenant,
-                table[:-1],
-                resource_id,
-                rev,
-                "updated" if previous else "created",
-                body.command_id,
-                actor["id"],
-                actor["display_name"],
-                previous["revision"] if previous else None,
-                rev,
-                now,
-                sorted(
-                    key
-                    for key, value in definition.items()
-                    if not previous or public(previous)[key] != value
-                ),
-            ),
-        )
-        conn.execute(
-            "UPDATE tenant_view_state SET view_generation=view_generation+1,resource_generation=resource_generation+1 WHERE tenant_id=%s",
-            (tenant,),
+            table,
+            actor,
+            previous,
+            definition,
+            body.command_id,
+            resource_id,
+            body.panels if table == "dashboards" else None,
         )
         return save_result(
             conn,
@@ -310,6 +230,109 @@ def save(request, tenant, table, body, resource_id=None):
             {"data": public(result), "meta": {"revision": str(rev)}},
             200 if previous else 201,
         )
+
+
+def write_revision(
+    conn, tenant, table, actor, previous, definition, command_id, resource_id=None, panels=None
+):
+    """Store one new preset or dashboard revision with its history and activity.
+
+    The caller holds the configuration guard and the locked previous row, has
+    validated the definition and checked that it differs. Shared by the save
+    route and the REV-77 conversion command. Returns (stored row, revision).
+    """
+    now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+    resource_id = resource_id or str(uuid4())
+    rev = previous["revision"] + 1 if previous else 1
+    common = (
+        resource_id,
+        tenant,
+        definition["name"],
+        name_key(definition["name"]),
+        rev,
+        now,
+        now,
+        actor["id"],
+        actor["id"],
+    )
+    if table == "presets":
+        conn.execute(
+            "INSERT INTO presets(id,tenant_id,name,name_key,revision,created_at,updated_at,created_by,updated_by,cel,profile,sort,columns,group_by,noisy) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,name_key=EXCLUDED.name_key,revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by,cel=EXCLUDED.cel,sort=EXCLUDED.sort,columns=EXCLUDED.columns,group_by=EXCLUDED.group_by,noisy=EXCLUDED.noisy",
+            common
+            + (
+                definition["cel"],
+                "keep-cel-v1",
+                Jsonb(definition["sort"]),
+                Jsonb(definition["columns"]),
+                definition["group_by"],
+                definition["noisy"],
+            ),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO dashboards(id,tenant_id,name,name_key,revision,created_at,updated_at,created_by,updated_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,name_key=EXCLUDED.name_key,revision=EXCLUDED.revision,updated_at=EXCLUDED.updated_at,updated_by=EXCLUDED.updated_by",
+            common,
+        )
+        conn.execute(
+            "DELETE FROM dashboard_panels WHERE tenant_id=%s AND dashboard_id=%s",
+            (tenant, resource_id),
+        )
+        mark_used(conn, tenant, images_of(panels), now)
+        for panel in panels:
+            counted = panel.type in ("count", "servicenow", "incident_count")
+            image = panel.type == "image"
+            conn.execute(
+                "INSERT INTO dashboard_panels(id,tenant_id,dashboard_id,type,preset_id,image_id,title,x,y,w,h,thresholds,content) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    panel.id,
+                    tenant,
+                    resource_id,
+                    panel.type,
+                    panel.preset_id if panel.type in PRESET_TYPES else None,
+                    panel.image_id if image else None,
+                    panel.title,
+                    panel.x,
+                    panel.y,
+                    panel.w,
+                    panel.h,
+                    Jsonb([t.model_dump() for t in panel.thresholds] if counted else []),
+                    Jsonb(panel_content(panel)),
+                ),
+            )
+    result = get_definition(conn, tenant, table, resource_id)
+    conn.execute(
+        sql.SQL(
+            "INSERT INTO {}(tenant_id,id,revision,snapshot,recorded_at,actor_id) VALUES(%s,%s,%s,%s,%s,%s)"
+        ).format(sql.Identifier(TABLES[table])),
+        (tenant, resource_id, rev, Jsonb(public(result)), now, actor["id"]),
+    )
+    conn.execute(
+        "INSERT INTO configuration_activity(id,tenant_id,resource_kind,resource_id,revision,kind,command_id,actor_id,actor_label,before_revision,after_revision,recorded_at,changed_fields) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (
+            uuid4(),
+            tenant,
+            table[:-1],
+            resource_id,
+            rev,
+            "updated" if previous else "created",
+            command_id,
+            actor["id"],
+            actor["display_name"],
+            previous["revision"] if previous else None,
+            rev,
+            now,
+            sorted(
+                key
+                for key, value in definition.items()
+                if not previous or public(previous)[key] != value
+            ),
+        ),
+    )
+    conn.execute(
+        "UPDATE tenant_view_state SET view_generation=view_generation+1,resource_generation=resource_generation+1 WHERE tenant_id=%s",
+        (tenant,),
+    )
+    return result, rev
 
 
 def public(row):
