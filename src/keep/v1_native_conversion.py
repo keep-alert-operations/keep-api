@@ -291,6 +291,16 @@ def convert_alerts(db, tenant, reverse, dry_run, report, profile, batch=BATCH):
                 continue
             report.root["alerts"]["planned"] += 1
             if dry_run:
+                # Report what the real run would hold, without locks or writes.
+                catalog = prepare_for_tenant(db, tenant, profile, alert_id=str(candidate["id"]))
+                with db.transaction(tenant) as conn:
+                    now = conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+                target = as_legacy(candidate) if reverse else as_sent(candidate)
+                windows = held_by(catalog, candidate, target, now, 0, reverse=reverse)
+                if windows:
+                    report.root["alerts"]["held"].append(
+                        {"id": str(candidate["id"]), "windows": windows}
+                    )
                 continue
             try:
                 catalog = prepare_for_tenant(db, tenant, profile, alert_id=str(candidate["id"]))
@@ -300,7 +310,12 @@ def convert_alerts(db, tenant, reverse, dry_run, report, profile, batch=BATCH):
                     lock_linked_incidents(conn, tenant, candidate["id"], contexts_locked=True)
                     row = retained(conn, tenant, candidate["id"], True)
                     windows = held_by(
-                        catalog, row, as_legacy(row) if reverse else as_sent(row), now, 0
+                        catalog,
+                        row,
+                        as_legacy(row) if reverse else as_sent(row),
+                        now,
+                        0,
+                        reverse=reverse,
                     )
                     if windows:
                         # A started window in the other words would change its

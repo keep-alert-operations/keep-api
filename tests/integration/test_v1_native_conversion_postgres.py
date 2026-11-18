@@ -215,6 +215,8 @@ def test_conversion_keeps_proof_suppression_and_is_reversible(db, cipher, monkey
 
     dry = run(db, actor_id, dry_run=True)["v1_native_conversion"]
     assert dry["alerts"]["planned"] == 2 and dry["alerts"]["converted"] == 0
+    # The dry run already names the alert the real run will hold.
+    assert [item["id"] for item in dry["alerts"]["held"]] == [str(db_alert)]
     assert read(db, tenant, "presets", saved["id"])["revision"] == 1
     assert alert(db, tenant, web_alert)["component"] == "web"
 
@@ -304,6 +306,63 @@ def test_conversion_keeps_proof_suppression_and_is_reversible(db, cipher, monkey
     twice = run(db, actor_id, reverse=True)["v1_native_conversion"]
     assert twice["alerts"]["converted"] == 0
     assert all(not items for items in twice["definitions"].values())
+
+
+def test_window_in_the_new_words_suppresses_at_conversion_and_reverse_keeps_it(
+    db, cipher, monkeypatch
+):
+    """Requirements: REV-77; plan A5 and A10; maintenance 6.
+
+    A started window written in the v1 words sees the converted alerts: the
+    conversion (by the command, or on touch) opens its cause, a new v1 alert is
+    suppressed, and `--reverse` keeps the converted alerts in the v1 words while
+    that window would otherwise release them.
+    """
+    with db.transaction() as conn:
+        tenant = conn.execute("SELECT id FROM tenants WHERE kind='global'").fetchone()["id"]
+        actor_id = uuid4()
+        conn.execute(
+            "INSERT INTO principals(id,directory_source,object_id,kind,display_name,eligible) VALUES(%s,'test',%s,'user','Conversion operator',true)",
+            (actor_id, str(actor_id)),
+        )
+    actor = {"id": actor_id, "display_name": "Conversion operator"}
+    now = datetime.now(UTC).replace(microsecond=0)
+    base = {"operator": "legacy", "time_created": "01-01-2026 00:00:00", "application": "pay"}
+    batch = dict(base, node_name="n1", object="db", message="down", severity="error")
+    touched = dict(base, node_name="n2", object="db", message="down", severity="error")
+
+    old_words(monkeypatch)
+    by_command = send(db, cipher, tenant, batch)
+    on_touch = send(db, cipher, tenant, touched)
+    monkeypatch.undo()
+    assert alert(db, tenant, by_command)["component"] == "db"
+    started = window(db, tenant, actor, 'object == "db"', now - timedelta(minutes=5), now + timedelta(hours=2))
+    # Maintenance never scans: the old rows do not match until they are converted.
+    assert suppressed(db, tenant, by_command) == (False, False)
+
+    send(db, cipher, tenant, dict(touched, message="still down"))
+    row = alert(db, tenant, on_touch)
+    assert (row["object"], row["component"], row["severity"]) == ("db", None, "error")
+    assert suppressed(db, tenant, on_touch) == (True, True)
+
+    report = run(db, actor_id)["v1_native_conversion"]
+    assert report["alerts"]["converted"] == 1 and report["alerts"]["held"] == []
+    row = alert(db, tenant, by_command)
+    assert (row["object"], row["component"], row["severity"]) == ("db", None, "error")
+    assert suppressed(db, tenant, by_command) == (True, True)
+    fresh = send(db, cipher, tenant, dict(base, node_name="n3", object="db", message="m", severity="error"))
+    assert suppressed(db, tenant, fresh) == (True, True)
+    assert count(db, tenant, "SELECT count(*) FROM incidents WHERE tenant_id=%s") == 0
+
+    back = run(db, actor_id, reverse=True)["v1_native_conversion"]
+    held = {item["id"] for item in back["alerts"]["held"]}
+    assert held == {str(by_command), str(on_touch), str(fresh)}
+    assert (str(started["id"]), "maintenance_start_locked") in {
+        (item["id"], item["reason"]) for item in back["skipped"]
+    }
+    for alert_id in (by_command, on_touch, fresh):
+        assert alert(db, tenant, alert_id)["object"] == "db"
+        assert suppressed(db, tenant, alert_id) == (True, True)
 
 
 def test_source_update_converts_an_old_row_on_touch(db, cipher, monkeypatch):
