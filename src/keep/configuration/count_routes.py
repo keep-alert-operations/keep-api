@@ -402,6 +402,9 @@ def _dashboard_counts(request, tenant, *, dashboard_id=None, expected=None, cand
                 "panel_id": str(panel["id"]),
                 "preset_id": str(panel["preset_id"]),
                 "preset_name": presets[str(panel["preset_id"])]["name"],
+                # The saved alarm flag, read with the counted revision, so a dashboard
+                # sounds for its noisy panels (REV-78).
+                "preset_noisy": bool(presets[str(panel["preset_id"])]["noisy"]),
                 **(
                     incidents[_incident_key(panel)]
                     if panel["type"] == "incident_count"
